@@ -71,7 +71,8 @@ def generate_topk_idx_example(
 def setup_native_sparse_attention(
     hidden_size, num_q_heads, num_kv_heads, head_dim, 
     kernel_size, kernel_stride, block_size, topk, init_blocks, 
-    local_blocks, window_size, use_rope=False
+    local_blocks, window_size, use_rope=False,
+    use_compressed_attn=True, use_topk_sparse_attn=True, use_sliding_window_attn=True
 ):
     if use_rope:
         rope_config = RopeConfig(
@@ -93,7 +94,10 @@ def setup_native_sparse_attention(
             init_blocks=init_blocks,
             local_blocks=local_blocks,
             window_size=window_size,
-            rope_config=rope_config
+            rope_config=rope_config,
+            use_compressed_attn=use_compressed_attn,
+            use_topk_sparse_attn=use_topk_sparse_attn,
+            use_sliding_window_attn=use_sliding_window_attn
         )
     else:
         return NativeSparseAttentionNoRoPE(
@@ -107,7 +111,10 @@ def setup_native_sparse_attention(
             topk=topk,
             init_blocks=init_blocks,
             local_blocks=local_blocks,
-            window_size=window_size
+            window_size=window_size,
+            use_compressed_attn=use_compressed_attn,
+            use_topk_sparse_attn=use_topk_sparse_attn,
+            use_sliding_window_attn=use_sliding_window_attn
         )
 
 
@@ -122,15 +129,24 @@ if __name__ == "__main__":
             line_arg="provider",
             line_vals=["flash-b1", "flash-b2",
                        "triton-flash-b1", "triton-flash-b2",
-                       "native-sparse-b1", "native-sparse-b2"],
+                       "native-sparse-b1", "native-sparse-b2",
+                       "nsa-compressed-b1", "nsa-compressed-b2",
+                       "nsa-topk-b1", "nsa-topk-b2",
+                       "nsa-sliding-b1", "nsa-sliding-b2"],
             line_names=[
-                "Flash-batch1", "Flash-batch2",
-                "Triton-Flash-batch1", "Triton-Flash-batch2",
-                "Native-Sparse-batch1", "Native-Sparse-batch2",
+                "Flash-b1", "Flash-b2",
+                "TritonFlash-b1", "TritonFlash-b2",
+                "NSA-All-b1", "NSA-All-b2",
+                "NSA-Comp-b1", "NSA-Comp-b2",
+                "NSA-Topk-b1", "NSA-Topk-b2",
+                "NSA-Slide-b1", "NSA-Slide-b2",
             ],
             styles=[("green", "-"), ("green", "--"),
                     ("red", "-"), ("red", "--"),
-                    ("blue", "-"), ("blue", "--")],
+                    ("blue", "-"), ("blue", "--"),
+                    ("purple", "-"), ("purple", "--"),
+                    ("orange", "-"), ("orange", "--"),
+                    ("brown", "-"), ("brown", "--")],
             ylabel="ms",
             plot_name="** forward pass comparison **",
             args={"H": 32, "D": 128},
@@ -149,13 +165,13 @@ if __name__ == "__main__":
         num_kv_heads = H // 8
         head_dim = D
         
-        # 修正：总序列长度 = N * batch_size
-        total_seqlen = N * batch_size  # 新增总序列长度计算
+        # Total sequence length = N * batch_size
+        total_seqlen = N * batch_size
         
-        # 修正：每个样本的序列长度固定为N
+        # Each sample has fixed length N
         cu_seqlens = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
         for i in range(1, batch_size + 1):
-            cu_seqlens[i] = cu_seqlens[i-1] + N  # 每个样本固定长度N
+            cu_seqlens[i] = cu_seqlens[i-1] + N
         
         sm_scale = 1 / math.sqrt(D)
         
@@ -171,7 +187,7 @@ if __name__ == "__main__":
         quantiles = [0.5, 0.2, 0.8]
         
         if method == "flash":
-            # 修正输入形状：总token数 = batch_size * N
+            # Input shape: total token count = batch_size * N
             q = torch.randn((batch_size * N, num_q_heads, head_dim), device="cuda", dtype=torch.bfloat16)
             k = torch.randn((batch_size * N, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
             v = torch.randn((batch_size * N, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
@@ -179,8 +195,8 @@ if __name__ == "__main__":
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: _flash_attn_varlen_forward(
                     q, k, v, cu_seqlens, cu_seqlens, 
-                    N,  # max_seqlen_q 修正为N
-                    N,  # max_seqlen_k 修正为N
+                    N,  # max_seqlen_q
+                    N,  # max_seqlen_k
                     dropout_p=0.0,
                     causal=True,
                     softmax_scale=sm_scale,
@@ -189,23 +205,22 @@ if __name__ == "__main__":
             )
             
         elif method == "triton-flash":
-            # 同样修正输入形状
+            # Same input shape
             q = torch.randn((batch_size * N, num_q_heads, head_dim), device="cuda", dtype=torch.bfloat16)
             k = torch.randn((batch_size * N, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
             v = torch.randn((batch_size * N, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
             
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: _flash_attention_fwd(
-                    q, k, v, cu_seqlens, cu_seqlens, N, N, True, sm_scale  # 修正max_seqlen参数
+                    q, k, v, cu_seqlens, cu_seqlens, N, N, True, sm_scale
                 ),
                 quantiles=quantiles,
             )
             
         elif method == "native-sparse":
-            # 修正输入形状
+            # All mechanisms enabled
             x = torch.randn((batch_size * N, hidden_size), device="cuda", dtype=torch.bfloat16)
             
-            # Setup native sparse attention model
             model = setup_native_sparse_attention(
                 hidden_size=hidden_size,
                 num_q_heads=num_q_heads,
@@ -225,6 +240,85 @@ if __name__ == "__main__":
                 quantiles=quantiles,
             )
             
+        elif method == "nsa-compressed":
+            # Only compressed attention enabled
+            x = torch.randn((batch_size * N, hidden_size), device="cuda", dtype=torch.bfloat16)
+            
+            model = setup_native_sparse_attention(
+                hidden_size=hidden_size,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                kernel_size=kernel_size,
+                kernel_stride=kernel_stride,
+                block_size=block_size,
+                topk=topk,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                window_size=window_size,
+                use_compressed_attn=True,
+                use_topk_sparse_attn=False,
+                use_sliding_window_attn=False
+            ).cuda().to(torch.bfloat16)
+            
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: model(x, cu_seqlens),
+                quantiles=quantiles,
+            )
+            
+        elif method == "nsa-topk":
+            # Only topk sparse attention enabled
+            # Note: topk depends on compressed attention for topk_idx
+            x = torch.randn((batch_size * N, hidden_size), device="cuda", dtype=torch.bfloat16)
+            
+            model = setup_native_sparse_attention(
+                hidden_size=hidden_size,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                kernel_size=kernel_size,
+                kernel_stride=kernel_stride,
+                block_size=block_size,
+                topk=topk,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                window_size=window_size,
+                use_compressed_attn=True,  # Needed for topk_idx
+                use_topk_sparse_attn=True,
+                use_sliding_window_attn=False
+            ).cuda().to(torch.bfloat16)
+            
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: model(x, cu_seqlens),
+                quantiles=quantiles,
+            )
+            
+        elif method == "nsa-sliding":
+            # Only sliding window attention enabled
+            x = torch.randn((batch_size * N, hidden_size), device="cuda", dtype=torch.bfloat16)
+            
+            model = setup_native_sparse_attention(
+                hidden_size=hidden_size,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                kernel_size=kernel_size,
+                kernel_stride=kernel_stride,
+                block_size=block_size,
+                topk=topk,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                window_size=window_size,
+                use_compressed_attn=False,
+                use_topk_sparse_attn=False,
+                use_sliding_window_attn=True
+            ).cuda().to(torch.bfloat16)
+            
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: model(x, cu_seqlens),
+                quantiles=quantiles,
+            )
+            
         return ms, min_ms, max_ms
 
     benchmark_forward.run(show_plots=True, print_data=True)
@@ -237,15 +331,24 @@ if __name__ == "__main__":
             line_arg="provider",
             line_vals=["flash-b1", "flash-b2",
                        "triton-flash-b1", "triton-flash-b2",
-                       "native-sparse-b1", "native-sparse-b2"],
+                       "native-sparse-b1", "native-sparse-b2",
+                       "nsa-compressed-b1", "nsa-compressed-b2",
+                       "nsa-topk-b1", "nsa-topk-b2",
+                       "nsa-sliding-b1", "nsa-sliding-b2"],
             line_names=[
-                "Flash-batch1", "Flash-batch2",
-                "Triton-Flash-batch1", "Triton-Flash-batch2",
-                "Native-Sparse-batch1", "Native-Sparse-batch2",
+                "Flash-b1", "Flash-b2",
+                "TritonFlash-b1", "TritonFlash-b2",
+                "NSA-All-b1", "NSA-All-b2",
+                "NSA-Comp-b1", "NSA-Comp-b2",
+                "NSA-Topk-b1", "NSA-Topk-b2",
+                "NSA-Slide-b1", "NSA-Slide-b2",
             ],
             styles=[("green", "-"), ("green", "--"),
                     ("red", "-"), ("red", "--"),
-                    ("blue", "-"), ("blue", "--")],
+                    ("blue", "-"), ("blue", "--"),
+                    ("purple", "-"), ("purple", "--"),
+                    ("orange", "-"), ("orange", "--"),
+                    ("brown", "-"), ("brown", "--")],
             ylabel="ms",
             plot_name="** backward pass comparison **",
             args={"H": 32, "D": 128},
@@ -328,13 +431,10 @@ if __name__ == "__main__":
             )
             
         elif method == "native-sparse":
-            # Create input for native sparse attention
+            # All attention mechanisms enabled
             x = torch.randn((total_seqlen, hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            
-            # Gradients for backward
             grad_out = torch.randn((total_seqlen, hidden_size), device="cuda", dtype=torch.bfloat16)
             
-            # Setup native sparse attention model
             model = setup_native_sparse_attention(
                 hidden_size=hidden_size,
                 num_q_heads=num_q_heads,
@@ -349,10 +449,101 @@ if __name__ == "__main__":
                 window_size=window_size
             ).cuda().to(torch.bfloat16)
             
-            # Forward pass
             output = model(x, cu_seqlens)
             
-            # Benchmark backward pass
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: torch.autograd.backward(
+                    output, grad_out, retain_graph=True
+                ),
+                quantiles=quantiles,
+            )
+            
+        elif method == "nsa-compressed":
+            # Only compressed attention enabled
+            x = torch.randn((total_seqlen, hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            grad_out = torch.randn((total_seqlen, hidden_size), device="cuda", dtype=torch.bfloat16)
+            
+            model = setup_native_sparse_attention(
+                hidden_size=hidden_size,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                kernel_size=kernel_size,
+                kernel_stride=kernel_stride,
+                block_size=block_size,
+                topk=topk,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                window_size=window_size,
+                use_compressed_attn=True,
+                use_topk_sparse_attn=False,
+                use_sliding_window_attn=False
+            ).cuda().to(torch.bfloat16)
+            
+            output = model(x, cu_seqlens)
+            
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: torch.autograd.backward(
+                    output, grad_out, retain_graph=True
+                ),
+                quantiles=quantiles,
+            )
+            
+        elif method == "nsa-topk":
+            # Only topk sparse attention enabled (with compressed for topk_idx)
+            x = torch.randn((total_seqlen, hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            grad_out = torch.randn((total_seqlen, hidden_size), device="cuda", dtype=torch.bfloat16)
+            
+            model = setup_native_sparse_attention(
+                hidden_size=hidden_size,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                kernel_size=kernel_size,
+                kernel_stride=kernel_stride,
+                block_size=block_size,
+                topk=topk,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                window_size=window_size,
+                use_compressed_attn=True,  # Needed for topk_idx
+                use_topk_sparse_attn=True,
+                use_sliding_window_attn=False
+            ).cuda().to(torch.bfloat16)
+            
+            output = model(x, cu_seqlens)
+            
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: torch.autograd.backward(
+                    output, grad_out, retain_graph=True
+                ),
+                quantiles=quantiles,
+            )
+            
+        elif method == "nsa-sliding":
+            # Only sliding window attention enabled
+            x = torch.randn((total_seqlen, hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            grad_out = torch.randn((total_seqlen, hidden_size), device="cuda", dtype=torch.bfloat16)
+            
+            model = setup_native_sparse_attention(
+                hidden_size=hidden_size,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                kernel_size=kernel_size,
+                kernel_stride=kernel_stride,
+                block_size=block_size,
+                topk=topk,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                window_size=window_size,
+                use_compressed_attn=False,
+                use_topk_sparse_attn=False,
+                use_sliding_window_attn=True
+            ).cuda().to(torch.bfloat16)
+            
+            output = model(x, cu_seqlens)
+            
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: torch.autograd.backward(
                     output, grad_out, retain_graph=True

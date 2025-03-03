@@ -94,9 +94,9 @@ class NativeSparseAttentionNoRoPE(torch.nn.Module):
             torch.zeros(self.num_kv_heads, self.kernel_size, self.head_dim)
         )
 
-        # gate function
+        # gate function - adjust size based on enabled attention mechanisms
         self.gate = torch.nn.Sequential(
-            torch.nn.Linear(self.hidden_size, self.num_q_heads * 3, bias=False),
+            torch.nn.Linear(self.hidden_size, self.num_q_heads * self.num_enabled_attns, bias=False),
             torch.nn.Sigmoid(),
         )
 
@@ -201,7 +201,7 @@ class NativeSparseAttentionNoRoPE(torch.nn.Module):
         if self.num_enabled_attns > 1:
             gate = self.gate(x)
             gate = rearrange(gate, "n (h g) -> n h g", g=self.num_enabled_attns)
-            attn_output = 0
+            attn_output = torch.zeros_like(attn_outputs[0])
             for i, output in enumerate(attn_outputs):
                 attn_output = attn_output + gate[..., i:i+1] * output
         else:
@@ -289,9 +289,9 @@ class NativeSparseAttention(torch.nn.Module):
             torch.zeros(self.num_kv_heads, self.kernel_size, self.head_dim)
         )
 
-        # gate function
+        # gate function - adjust size based on enabled attention mechanisms
         self.gate = torch.nn.Sequential(
-            torch.nn.Linear(self.hidden_size, self.num_q_heads * 3, bias=False),
+            torch.nn.Linear(self.hidden_size, self.num_q_heads * self.num_enabled_attns, bias=False),
             torch.nn.Sigmoid(),
         )
 
@@ -434,7 +434,7 @@ class NativeSparseAttention(torch.nn.Module):
         if self.num_enabled_attns > 1:
             gate = self.gate(x)
             gate = rearrange(gate, "n (h g) -> n h g", g=self.num_enabled_attns)
-            attn_output = 0
+            attn_output = torch.zeros_like(attn_outputs[0])
             for i, output in enumerate(attn_outputs):
                 attn_output = attn_output + gate[..., i:i+1] * output
         else:
