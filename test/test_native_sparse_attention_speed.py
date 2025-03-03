@@ -273,11 +273,13 @@ if __name__ == "__main__":
         local_blocks = 2
         window_size = 256
         
-        # Setup cu_seqlens for different batch sizes
-        seqlen_per_batch = N // batch_size
+        # Setup cu_seqlens for different batch sizes - keep sequence length fixed at N
         cu_seqlens = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
         for i in range(1, batch_size + 1):
-            cu_seqlens[i] = cu_seqlens[i-1] + seqlen_per_batch
+            cu_seqlens[i] = cu_seqlens[i-1] + N  # Each sample has fixed length N
+        
+        # Total sequence length across all batches
+        total_seqlen = N * batch_size
         
         sm_scale = 1 / math.sqrt(D)
         
@@ -285,17 +287,17 @@ if __name__ == "__main__":
         
         if method == "flash":
             # Create inputs with proper shapes for flash attention
-            q = torch.randn((batch_size * seqlen_per_batch, num_q_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            k = torch.randn((batch_size * seqlen_per_batch, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            v = torch.randn((batch_size * seqlen_per_batch, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            q = torch.randn((total_seqlen, num_q_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            k = torch.randn((total_seqlen, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            v = torch.randn((total_seqlen, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
             
             # Forward pass to get outputs needed for backward
             o = _flash_attn_varlen_forward(
-                q, k, v, cu_seqlens, cu_seqlens, seqlen_per_batch, seqlen_per_batch, dropout_p=0.0, causal=True, softmax_scale=sm_scale
+                q, k, v, cu_seqlens, cu_seqlens, N, N, dropout_p=0.0, causal=True, softmax_scale=sm_scale
             )[0]
             
             do = torch.randn_like(o)
-            lse = torch.randn((num_q_heads, batch_size * seqlen_per_batch), device="cuda", dtype=torch.float32)
+            lse = torch.randn((num_q_heads, total_seqlen), device="cuda", dtype=torch.float32)
             dq = torch.zeros_like(q)
             dk = torch.zeros_like(k)
             dv = torch.zeros_like(v)
@@ -303,7 +305,7 @@ if __name__ == "__main__":
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: _flash_attn_varlen_backward(
                     do, q, k, v, o, lse, dq, dk, dv, cu_seqlens, cu_seqlens, 
-                    seqlen_per_batch, seqlen_per_batch, dropout_p=0.0, causal=True, softmax_scale=sm_scale,
+                    N, N, dropout_p=0.0, causal=True, softmax_scale=sm_scale,
                     window_size_left=-1, window_size_right=-1, softcap=0.0, 
                     alibi_slopes=None, deterministic=False, zero_tensors=False
                 ),
@@ -312,25 +314,25 @@ if __name__ == "__main__":
             
         elif method == "triton-flash":
             # Create inputs with proper shapes for triton-flash
-            q = torch.randn((batch_size * seqlen_per_batch, num_q_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            k = torch.randn((batch_size * seqlen_per_batch, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            v = torch.randn((batch_size * seqlen_per_batch, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            q = torch.randn((total_seqlen, num_q_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            k = torch.randn((total_seqlen, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            v = torch.randn((total_seqlen, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
             
             # Forward pass to get outputs needed for backward
-            o, lse = _flash_attention_fwd(q, k, v, cu_seqlens, cu_seqlens, seqlen_per_batch, seqlen_per_batch, True, sm_scale)
+            o, lse = _flash_attention_fwd(q, k, v, cu_seqlens, cu_seqlens, N, N, True, sm_scale)
             do = torch.randn_like(o)
             
             ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: _flash_attention_bwd(o, do, lse, q, k, v, cu_seqlens, cu_seqlens, seqlen_per_batch, seqlen_per_batch, True, sm_scale),
+                lambda: _flash_attention_bwd(o, do, lse, q, k, v, cu_seqlens, cu_seqlens, N, N, True, sm_scale),
                 quantiles=quantiles,
             )
             
         elif method == "native-sparse":
             # Create input for native sparse attention
-            x = torch.randn((batch_size * seqlen_per_batch, hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            x = torch.randn((total_seqlen, hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True)
             
             # Gradients for backward
-            grad_out = torch.randn((batch_size * seqlen_per_batch, hidden_size), device="cuda", dtype=torch.bfloat16)
+            grad_out = torch.randn((total_seqlen, hidden_size), device="cuda", dtype=torch.bfloat16)
             
             # Setup native sparse attention model
             model = setup_native_sparse_attention(
