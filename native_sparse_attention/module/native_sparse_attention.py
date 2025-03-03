@@ -36,6 +36,9 @@ class NativeSparseAttentionNoRoPE(torch.nn.Module):
         init_blocks: int,
         local_blocks: int,
         window_size: int,
+        use_compressed_attn: bool = True,
+        use_topk_sparse_attn: bool = True,
+        use_sliding_window_attn: bool = True,
     ):
         super().__init__()
         # configs
@@ -50,7 +53,18 @@ class NativeSparseAttentionNoRoPE(torch.nn.Module):
         self.init_blocks = init_blocks
         self.local_blocks = local_blocks
         self.window_size = window_size
-
+        self.use_compressed_attn = use_compressed_attn
+        self.use_topk_sparse_attn = use_topk_sparse_attn
+        self.use_sliding_window_attn = use_sliding_window_attn
+        
+        # Count enabled attention mechanisms
+        self.num_enabled_attns = sum([
+            self.use_compressed_attn,
+            self.use_topk_sparse_attn,
+            self.use_sliding_window_attn
+        ])
+        assert self.num_enabled_attns > 0, "At least one attention mechanism must be enabled"
+        
         # qkv proj and o proj
         self.proj_q = torch.nn.Linear(
             self.hidden_size, self.num_q_heads * self.head_dim, bias=False
@@ -109,67 +123,90 @@ class NativeSparseAttentionNoRoPE(torch.nn.Module):
         k = self.proj_k(x).view(-1, self.num_kv_heads, self.head_dim)
         v = self.proj_v(x).view(-1, self.num_kv_heads, self.head_dim)
 
+        # Initialize attention outputs and gate indices
+        attn_outputs = []
+        gate_idx = 0
+        topk_idx = None
+        
         # compressed attention
-        compressed_k, compressed_cu_seqlens = conv_compress(
-            k,
-            self.compress_key,
-            cu_seqlens,
-            self.kernel_size,
-            self.kernel_stride,
-            self.intra_block_pe,
-        )
-        compressed_v, _ = conv_compress(
-            v,
-            self.compress_value,
-            cu_seqlens,
-            self.kernel_size,
-            self.kernel_stride,
-            None,
-        )
-        compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
-        compressed_attn_output, topk_idx = compressed_attention(
-            q,
-            compressed_k,
-            compressed_v,
-            self.kernel_size,
-            self.kernel_stride,
-            self.block_size,
-            self.topk,
-            cu_seqlens,
-            compressed_cu_seqlens,
-            seqlens.max().item(),
-            compressed_seqlens.max().item(),
-            None,
-            self.init_blocks,
-            self.local_blocks,
-        )
+        if self.use_compressed_attn:
+            compressed_k, compressed_cu_seqlens = conv_compress(
+                k,
+                self.compress_key,
+                cu_seqlens,
+                self.kernel_size,
+                self.kernel_stride,
+                self.intra_block_pe,
+            )
+            compressed_v, _ = conv_compress(
+                v,
+                self.compress_value,
+                cu_seqlens,
+                self.kernel_size,
+                self.kernel_stride,
+                None,
+            )
+            compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
+            compressed_attn_output, topk_idx = compressed_attention(
+                q,
+                compressed_k,
+                compressed_v,
+                self.kernel_size,
+                self.kernel_stride,
+                self.block_size,
+                self.topk,
+                cu_seqlens,
+                compressed_cu_seqlens,
+                seqlens.max().item(),
+                compressed_seqlens.max().item(),
+                None,
+                self.init_blocks,
+                self.local_blocks,
+            )
+            attn_outputs.append(compressed_attn_output)
+            gate_idx += 1
 
         # topk sparse attention
-        sparse_attn_output = topk_sparse_attention(
-            q, k, v, topk_idx, self.block_size, cu_seqlens, None
-        )
+        if self.use_topk_sparse_attn:
+            assert topk_idx is not None or not self.use_compressed_attn, "For topk sparse attention, either compressed attention must be used to generate topk_idx, or provide topk_idx directly"
+            if topk_idx is None and self.use_compressed_attn == False:
+                # If compressed attention is disabled but we need topk_idx, we need to generate it here
+                # This might require a separate implementation for generating topk_idx without doing compressed attention
+                # For now, we'll just raise an error
+                raise NotImplementedError("Topk sparse attention without compressed attention is not implemented yet")
+            
+            sparse_attn_output = topk_sparse_attention(
+                q, k, v, topk_idx, self.block_size, cu_seqlens, None
+            )
+            attn_outputs.append(sparse_attn_output)
+            gate_idx += 1
 
         # sliding window attention
-        sliding_attn_output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens,
-            cu_seqlens,
-            seqlens.max().item(),
-            seqlens.max().item(),
-            causal=True,
-            window_size=(self.window_size, -1),
-        )
+        if self.use_sliding_window_attn:
+            sliding_attn_output = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                cu_seqlens,
+                seqlens.max().item(),
+                seqlens.max().item(),
+                causal=True,
+                window_size=(self.window_size, -1),
+            )
+            attn_outputs.append(sliding_attn_output)
+            gate_idx += 1
 
         # gate average
-        gate = self.gate(x)
-        gate = rearrange(gate, "n (h g) -> n h g", g=3)
-        attn_output = (
-            gate[..., 0:1] * compressed_attn_output
-            + gate[..., 1:2] * sparse_attn_output
-            + gate[..., 2:3] * sliding_attn_output
-        )
+        if self.num_enabled_attns > 1:
+            gate = self.gate(x)
+            gate = rearrange(gate, "n (h g) -> n h g", g=self.num_enabled_attns)
+            attn_output = 0
+            for i, output in enumerate(attn_outputs):
+                attn_output = attn_output + gate[..., i:i+1] * output
+        else:
+            # If only one attention mechanism is enabled, use it directly
+            attn_output = attn_outputs[0]
 
         # rearrange and output proj
         attn_output = rearrange(attn_output, "n h d -> n (h d)")
@@ -193,6 +230,9 @@ class NativeSparseAttention(torch.nn.Module):
         local_blocks: int,
         window_size: int,
         rope_config: RopeConfig,
+        use_compressed_attn: bool = True,
+        use_topk_sparse_attn: bool = True,
+        use_sliding_window_attn: bool = True,
     ):
         super().__init__()
         # configs
@@ -208,7 +248,18 @@ class NativeSparseAttention(torch.nn.Module):
         self.local_blocks = local_blocks
         self.window_size = window_size
         self.rope_config = rope_config
-
+        self.use_compressed_attn = use_compressed_attn
+        self.use_topk_sparse_attn = use_topk_sparse_attn
+        self.use_sliding_window_attn = use_sliding_window_attn
+        
+        # Count enabled attention mechanisms
+        self.num_enabled_attns = sum([
+            self.use_compressed_attn,
+            self.use_topk_sparse_attn,
+            self.use_sliding_window_attn
+        ])
+        assert self.num_enabled_attns > 0, "At least one attention mechanism must be enabled"
+        
         # qkv proj and o proj
         self.proj_q = torch.nn.Linear(
             self.hidden_size, self.num_q_heads * self.head_dim, bias=False
@@ -270,78 +321,104 @@ class NativeSparseAttention(torch.nn.Module):
         k = self.proj_k(x).view(-1, self.num_kv_heads, self.head_dim)
         v = self.proj_v(x).view(-1, self.num_kv_heads, self.head_dim)
 
-        # compressed key and value before rope
-        compressed_k, compressed_cu_seqlens = conv_compress(
-            k,
-            self.compress_key,
-            cu_seqlens,
-            self.kernel_size,
-            self.kernel_stride,
-            self.intra_block_pe,
-        )
-        compressed_v, _ = conv_compress(
-            v,
-            self.compress_value,
-            cu_seqlens,
-            self.kernel_size,
-            self.kernel_stride,
-            None,
-        )
+        # Initialize attention outputs and gate indices
+        attn_outputs = []
+        gate_idx = 0
+        topk_idx = None
+        compressed_k = None
+        
+        # compressed key and value before rope if needed
+        if self.use_compressed_attn or self.use_topk_sparse_attn:
+            compressed_k, compressed_cu_seqlens = conv_compress(
+                k,
+                self.compress_key,
+                cu_seqlens,
+                self.kernel_size,
+                self.kernel_stride,
+                self.intra_block_pe,
+            )
+            compressed_v, _ = conv_compress(
+                v,
+                self.compress_value,
+                cu_seqlens,
+                self.kernel_size,
+                self.kernel_stride,
+                None,
+            )
 
-        # do rope for query and compressed key
+        # Apply RoPE to query
         q = self.rope(q, cu_seqlens)
-        compressed_k = self.rope(
-            compressed_k, compressed_cu_seqlens, start=0, stride=self.kernel_stride
-        )
+        
+        # Apply RoPE to compressed key if it exists
+        if compressed_k is not None:
+            compressed_k = self.rope(
+                compressed_k, compressed_cu_seqlens, start=0, stride=self.kernel_stride
+            )
 
-        # attention between query and compressed key value
-        compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
-        compressed_attn_output, topk_idx = compressed_attention(
-            q,
-            compressed_k,
-            compressed_v,
-            self.kernel_size,
-            self.kernel_stride,
-            self.block_size,
-            self.topk,
-            cu_seqlens,
-            compressed_cu_seqlens,
-            seqlens.max().item(),
-            compressed_seqlens.max().item(),
-            None,
-            self.init_blocks,
-            self.local_blocks,
-        )
+        # compressed attention
+        if self.use_compressed_attn:
+            compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
+            compressed_attn_output, topk_idx = compressed_attention(
+                q,
+                compressed_k,
+                compressed_v,
+                self.kernel_size,
+                self.kernel_stride,
+                self.block_size,
+                self.topk,
+                cu_seqlens,
+                compressed_cu_seqlens,
+                seqlens.max().item(),
+                compressed_seqlens.max().item(),
+                None,
+                self.init_blocks,
+                self.local_blocks,
+            )
+            attn_outputs.append(compressed_attn_output)
+            gate_idx += 1
 
-        # do rope for original key
+        # Apply RoPE to key for other attention mechanisms
         k = self.rope(k, cu_seqlens)
 
         # topk sparse attention
-        sparse_attn_output = topk_sparse_attention(
-            q, k, v, topk_idx, self.block_size, cu_seqlens, None
-        )
+        if self.use_topk_sparse_attn:
+            assert topk_idx is not None or not self.use_compressed_attn, "For topk sparse attention, either compressed attention must be used to generate topk_idx, or provide topk_idx directly"
+            if topk_idx is None and self.use_compressed_attn == False:
+                # If we need topk_idx but compressed attention is disabled
+                raise NotImplementedError("Topk sparse attention without compressed attention is not implemented yet")
+                
+            sparse_attn_output = topk_sparse_attention(
+                q, k, v, topk_idx, self.block_size, cu_seqlens, None
+            )
+            attn_outputs.append(sparse_attn_output)
+            gate_idx += 1
 
         # sliding window attention
-        sliding_attn_output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens,
-            cu_seqlens,
-            seqlens.max().item(),
-            seqlens.max().item(),
-            causal=True,
-            window_size=(self.window_size, -1),
-        )
+        if self.use_sliding_window_attn:
+            sliding_attn_output = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                cu_seqlens,
+                seqlens.max().item(),
+                seqlens.max().item(),
+                causal=True,
+                window_size=(self.window_size, -1),
+            )
+            attn_outputs.append(sliding_attn_output)
+            gate_idx += 1
 
         # gate average
-        gate = self.gate(x)
-        gate = rearrange(gate, "n (h g) -> n h g", g=3)
-        attn_output = (
-            gate[..., 0:1] * compressed_attn_output
-            + gate[..., 1:2] * sparse_attn_output
-            + gate[..., 2:3] * sliding_attn_output
-        )
+        if self.num_enabled_attns > 1:
+            gate = self.gate(x)
+            gate = rearrange(gate, "n (h g) -> n h g", g=self.num_enabled_attns)
+            attn_output = 0
+            for i, output in enumerate(attn_outputs):
+                attn_output = attn_output + gate[..., i:i+1] * output
+        else:
+            # If only one attention mechanism is enabled, use it directly
+            attn_output = attn_outputs[0]
 
         # rearrange and output proj
         attn_output = rearrange(attn_output, "n h d -> n (h d)")
