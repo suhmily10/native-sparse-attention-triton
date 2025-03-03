@@ -6,8 +6,10 @@ import triton
 import math
 from native_sparse_attention.module.native_sparse_attention import NativeSparseAttention
 from native_sparse_attention.module.rope import RopeConfig
+from native_sparse_attention.ops.triton.flash_attention import _flash_attention_fwd
+from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
 
-def setup_model(hidden_size=4096, num_q_heads=32, num_kv_heads=4, head_dim=128):
+def setup_native_sparse_attention(hidden_size=4096, num_q_heads=32, num_kv_heads=4, head_dim=128):
     rope_config = RopeConfig(
         head_dim=head_dim,
         rope_theta=10000.0,
@@ -37,76 +39,181 @@ def setup_model(hidden_size=4096, num_q_heads=32, num_kv_heads=4, head_dim=128):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['seq_len'],
-        x_vals=[2**i for i in range(10, 14)],  # Reduced from 15 to 14 to avoid memory issues
-        line_arg='batch_size',
-        line_vals=[1, 4, 16],
-        line_names=['bs=1', 'bs=4', 'bs=16'],
+        x_vals=[2**i for i in range(10, 14)],  # Reduced to avoid memory issues
+        line_arg='method',
+        line_vals=['native-sparse', 'flash-attn', 'flash-triton'],
+        line_names=['Native Sparse Attention', 'Flash Attention', 'Flash Triton'],
         styles=[('blue', '-'), ('green', '--'), ('red', '-.')],
         ylabel='Tokens/s',
         plot_name='prefill_throughput',
-        args={'hidden_size': 4096}
+        args={'hidden_size': 4096, 'batch_size': 1}
     )
 )
-def benchmark_prefill(seq_len, batch_size, hidden_size):
+def benchmark_prefill(seq_len, method, hidden_size, batch_size):
     # Limit the maximum tokens to avoid CUDA memory errors
     if seq_len * batch_size > 32768:
         return 0, None, None  # Skip this configuration
-        
-    model = setup_model(hidden_size)
+    
     total_tokens = seq_len * batch_size
+    hidden_size = hidden_size
+    num_q_heads = 32
+    num_kv_heads = 4
+    head_dim = 128
+    sm_scale = 1 / math.sqrt(head_dim)
     
-    # Create input with shape [batch_size * seq_len, hidden_size]
-    x = torch.randn((batch_size * seq_len, hidden_size), device='cuda', dtype=torch.bfloat16)
+    # Create cu_seqlens for the batch
     cu_seqlens = torch.arange(0, (batch_size+1)*seq_len, seq_len, device='cuda', dtype=torch.int32)
-
-    # Warmup
-    for _ in range(3):
-        model(x, cu_seqlens)
     
-    # Benchmark
-    ms_per_token = triton.testing.do_bench(
-        lambda: model(x, cu_seqlens),
-        quantiles=[0.5, 0.2, 0.8]
-    )[0] / total_tokens
-
+    if method == 'native-sparse':
+        # Setup for Native Sparse Attention
+        model = setup_native_sparse_attention(hidden_size)
+        x = torch.randn((batch_size * seq_len, hidden_size), device='cuda', dtype=torch.bfloat16)
+        
+        # Warmup
+        for _ in range(3):
+            model(x, cu_seqlens)
+        
+        # Benchmark
+        ms_per_token = triton.testing.do_bench(
+            lambda: model(x, cu_seqlens),
+            quantiles=[0.5, 0.2, 0.8]
+        )[0] / total_tokens
+        
+    elif method == 'flash-attn':
+        # Setup for Flash Attention
+        q = torch.randn((batch_size * seq_len, num_q_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        k = torch.randn((batch_size * seq_len, num_kv_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        v = torch.randn((batch_size * seq_len, num_kv_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        
+        # Warmup
+        for _ in range(3):
+            _flash_attn_varlen_forward(
+                q, k, v, cu_seqlens, cu_seqlens, 
+                seq_len, seq_len, dropout_p=0.0, 
+                causal=True, softmax_scale=sm_scale
+            )
+        
+        # Benchmark
+        ms_per_token = triton.testing.do_bench(
+            lambda: _flash_attn_varlen_forward(
+                q, k, v, cu_seqlens, cu_seqlens, 
+                seq_len, seq_len, dropout_p=0.0, 
+                causal=True, softmax_scale=sm_scale
+            ),
+            quantiles=[0.5, 0.2, 0.8]
+        )[0] / total_tokens
+        
+    elif method == 'flash-triton':
+        # Setup for Flash Triton
+        q = torch.randn((batch_size * seq_len, num_q_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        k = torch.randn((batch_size * seq_len, num_kv_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        v = torch.randn((batch_size * seq_len, num_kv_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        
+        # Warmup
+        for _ in range(3):
+            _flash_attention_fwd(
+                q, k, v, cu_seqlens, cu_seqlens, 
+                seq_len, seq_len, True, sm_scale
+            )
+        
+        # Benchmark
+        ms_per_token = triton.testing.do_bench(
+            lambda: _flash_attention_fwd(
+                q, k, v, cu_seqlens, cu_seqlens, 
+                seq_len, seq_len, True, sm_scale
+            ),
+            quantiles=[0.5, 0.2, 0.8]
+        )[0] / total_tokens
+    
     return total_tokens / (ms_per_token * 1e-3), None, None  # tokens per second
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=['seq_len'],
-        x_vals=[2**i for i in range(8, 15)],
-        line_arg='batch_size',
-        line_vals=[1, 4, 16],
-        line_names=['bs=1', 'bs=4', 'bs=16'],
+        x_names=['batch_size'],
+        x_vals=[1, 16, 32, 128],
+        line_arg='method',
+        line_vals=['native-sparse', 'flash-attn', 'flash-triton'],
+        line_names=['Native Sparse Attention', 'Flash Attention', 'Flash Triton'],
         styles=[('blue', '-'), ('green', '--'), ('red', '-.')],
         ylabel='Tokens/s',
         plot_name='decoding_throughput',
         args={'hidden_size': 4096}
     )
 )
-def benchmark_decoding(seq_len, batch_size, hidden_size):
+def benchmark_decoding(batch_size, method, hidden_size):
     # For the decoding benchmark, ensure we use at least kernel_size tokens
     # since conv_compress requires input length >= kernel_size
     min_seq_len = 16  # Same as kernel_size in setup_model
     
-    model = setup_model(hidden_size)
-    
-    # Create input with shape [batch_size * min_seq_len, hidden_size]
-    # We'll only measure the throughput of the last token
-    x = torch.randn((batch_size * min_seq_len, hidden_size), device='cuda', dtype=torch.bfloat16)
+    hidden_size = hidden_size
+    num_q_heads = 32
+    num_kv_heads = 4
+    head_dim = 128
+    sm_scale = 1 / math.sqrt(head_dim)
     
     # Create cu_seqlens to simulate having min_seq_len tokens per sequence
     cu_seqlens = torch.arange(0, (batch_size+1)*min_seq_len, min_seq_len, device='cuda', dtype=torch.int32)
     
-    # Warmup and compile
-    for _ in range(3):
-        model(x, cu_seqlens)
-    
-    # Benchmark decoding latency
-    ms_per_token = triton.testing.do_bench(
-        lambda: model(x, cu_seqlens),
-        quantiles=[0.5, 0.2, 0.8]
-    )[0] / batch_size  # Dividing by batch_size to get ms per token
+    if method == 'native-sparse':
+        # Setup for Native Sparse Attention
+        model = setup_native_sparse_attention(hidden_size)
+        x = torch.randn((batch_size * min_seq_len, hidden_size), device='cuda', dtype=torch.bfloat16)
+        
+        # Warmup
+        for _ in range(3):
+            model(x, cu_seqlens)
+        
+        # Benchmark
+        ms_per_token = triton.testing.do_bench(
+            lambda: model(x, cu_seqlens),
+            quantiles=[0.5, 0.2, 0.8]
+        )[0] / batch_size  # Measure per token in batch
+        
+    elif method == 'flash-attn':
+        # Setup for Flash Attention
+        q = torch.randn((batch_size * min_seq_len, num_q_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        k = torch.randn((batch_size * min_seq_len, num_kv_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        v = torch.randn((batch_size * min_seq_len, num_kv_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        
+        # Warmup
+        for _ in range(3):
+            _flash_attn_varlen_forward(
+                q, k, v, cu_seqlens, cu_seqlens, 
+                min_seq_len, min_seq_len, dropout_p=0.0, 
+                causal=True, softmax_scale=sm_scale
+            )
+        
+        # Benchmark
+        ms_per_token = triton.testing.do_bench(
+            lambda: _flash_attn_varlen_forward(
+                q, k, v, cu_seqlens, cu_seqlens, 
+                min_seq_len, min_seq_len, dropout_p=0.0, 
+                causal=True, softmax_scale=sm_scale
+            ),
+            quantiles=[0.5, 0.2, 0.8]
+        )[0] / batch_size  # Measure per token in batch
+        
+    elif method == 'flash-triton':
+        # Setup for Flash Triton
+        q = torch.randn((batch_size * min_seq_len, num_q_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        k = torch.randn((batch_size * min_seq_len, num_kv_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        v = torch.randn((batch_size * min_seq_len, num_kv_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        
+        # Warmup
+        for _ in range(3):
+            _flash_attention_fwd(
+                q, k, v, cu_seqlens, cu_seqlens, 
+                min_seq_len, min_seq_len, True, sm_scale
+            )
+        
+        # Benchmark
+        ms_per_token = triton.testing.do_bench(
+            lambda: _flash_attention_fwd(
+                q, k, v, cu_seqlens, cu_seqlens, 
+                min_seq_len, min_seq_len, True, sm_scale
+            ),
+            quantiles=[0.5, 0.2, 0.8]
+        )[0] / batch_size  # Measure per token in batch
     
     return batch_size / (ms_per_token * 1e-3), None, None  # tokens per second
 
