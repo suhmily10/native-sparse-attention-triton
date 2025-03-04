@@ -163,7 +163,7 @@ class NativeSparseAttentionNoRoPE(torch.nn.Module):
                 self.init_blocks, # 1   
                 self.local_blocks, # 1
             )
-            import pdb; pdb.set_trace()
+            # import pdb; pdb.set_trace()
             #(Pdb) topk_idx.shape torch.Size([4, 1024, 8]) [num_kv_heads, total_query_len, topk]
             # compressed_attn_output.shape torch.Size([1024, 32, 128])
             attn_outputs.append(compressed_attn_output)
