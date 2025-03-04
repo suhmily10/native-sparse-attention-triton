@@ -1,12 +1,14 @@
 import torch
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Literal
 from native_sparse_attention.ops.triton.compressed_attention import compressed_attention
 from native_sparse_attention.ops.triton.topk_sparse_attention import topk_sparse_attention
-from native_sparse_attention.ops import (
-    compressed_attention,
-    topk_sparse_attention,
+from native_sparse_attention.ops.torch.compress_key_value import (
     conv_compress,
+    linear_compress,
+    avgpool_compress,
+    weightedpool_compress,
 )
+
 def fused_compressed_topk_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -23,6 +25,7 @@ def fused_compressed_topk_attention(
     sm_scale: Optional[float] = None,
     init_blocks: int = 1,
     local_blocks: int = 2,
+    compression_method: Literal["conv", "linear", "avgpool", "weighted"] = "linear",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused operation that combines compressed attention and topk sparse attention.
     
@@ -45,27 +48,92 @@ def fused_compressed_topk_attention(
         sm_scale (Optional[float]): Softmax scale, defaults to 1/sqrt(head_dim)
         init_blocks (int): Number of initial blocks to always include
         local_blocks (int): Number of local blocks to always include
+        compression_method (str): Compression method, one of ["conv", "linear", "avgpool", "weighted"]
         
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Attention output and topk indices
     """
     # First compress keys and values
-    compressed_k, compressed_cu_seqlens = conv_compress(
-        k,
-        compress_key,
-        cu_seqlens,
-        kernel_size,
-        kernel_stride,
-        intra_block_pe,
-    )
-    compressed_v, _ = conv_compress(
-        v,
-        compress_value,
-        cu_seqlens,
-        kernel_size,
-        kernel_stride,
-        None,
-    )
+    if compression_method == "conv":
+        compressed_k, compressed_cu_seqlens = conv_compress(
+            k,
+            compress_key,
+            cu_seqlens,
+            kernel_size,
+            kernel_stride,
+            intra_block_pe,
+        )
+        compressed_v, _ = conv_compress(
+            v,
+            compress_value,
+            cu_seqlens,
+            kernel_size,
+            kernel_stride,
+            None,
+        )
+    elif compression_method == "linear":
+        # Reshape to match expected shape for linear_compress
+        total_len, num_heads, head_dim = k.shape
+        reshaped_key_weights = compress_key.view(num_heads, kernel_size * head_dim, head_dim)
+        reshaped_value_weights = compress_value.view(num_heads, kernel_size * head_dim, head_dim)
+        
+        compressed_k, compressed_cu_seqlens = linear_compress(
+            k,
+            reshaped_key_weights,
+            cu_seqlens,
+            kernel_size,
+            kernel_stride,
+            intra_block_pe,
+        )
+        compressed_v, _ = linear_compress(
+            v,
+            reshaped_value_weights,
+            cu_seqlens,
+            kernel_size,
+            kernel_stride,
+            None,
+        )
+    elif compression_method == "avgpool":
+        compressed_k, compressed_cu_seqlens = avgpool_compress(
+            k,
+            None,  # avgpool doesn't need weights
+            cu_seqlens,
+            kernel_size,
+            kernel_stride,
+            intra_block_pe,
+        )
+        compressed_v, _ = avgpool_compress(
+            v,
+            None,
+            cu_seqlens,
+            kernel_size,
+            kernel_stride,
+            None,
+        )
+    elif compression_method == "weighted":
+        # Reshape to match expected shape for weightedpool_compress
+        total_len, num_heads, head_dim = k.shape
+        reshaped_key_weights = compress_key.view(num_heads, kernel_size)
+        reshaped_value_weights = compress_value.view(num_heads, kernel_size)
+        
+        compressed_k, compressed_cu_seqlens = weightedpool_compress(
+            k,
+            reshaped_key_weights,
+            cu_seqlens,
+            kernel_size,
+            kernel_stride,
+            intra_block_pe,
+        )
+        compressed_v, _ = weightedpool_compress(
+            v,
+            reshaped_value_weights,
+            cu_seqlens,
+            kernel_size,
+            kernel_stride,
+            None,
+        )
+    else:
+        raise ValueError(f"Unsupported compression method: {compression_method}")
     
     # Calculate required metrics
     compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]

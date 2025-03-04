@@ -177,12 +177,12 @@ if __name__ == "__main__":
         
         # Additional parameters for native-sparse
         kernel_size = 16
-        kernel_stride = 4
-        block_size = 64
-        topk = 8
+        kernel_stride = 8
+        block_size = 128
+        topk = 4
         init_blocks = 1
-        local_blocks = 2
-        window_size = 256
+        local_blocks = 1
+        window_size = 128
         
         quantiles = [0.5, 0.2, 0.8]
         
@@ -368,13 +368,13 @@ if __name__ == "__main__":
         head_dim = D
         
         # Additional parameters for native-sparse
-        kernel_size = 16
-        kernel_stride = 4
+        kernel_size = 32
+        kernel_stride = 16
         block_size = 64
-        topk = 8
+        topk = 16
         init_blocks = 1
         local_blocks = 2
-        window_size = 256
+        window_size = 512
         
         # Setup cu_seqlens for different batch sizes - keep sequence length fixed at N
         cu_seqlens = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
