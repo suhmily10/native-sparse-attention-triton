@@ -148,21 +148,22 @@ class NativeSparseAttentionNoRoPE(torch.nn.Module):
             )
             compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
             compressed_attn_output, topk_idx = compressed_attention(
-                q,
-                compressed_k,
-                compressed_v,
-                self.kernel_size,
-                self.kernel_stride,
-                self.block_size,
-                self.topk,
-                cu_seqlens,
-                compressed_cu_seqlens,
-                seqlens.max().item(),
-                compressed_seqlens.max().item(),
+                q, # torch.Size([2048, 32, 128])
+                compressed_k, # torch.Size([255, 4, 128])
+                compressed_v, # torch.Size([255, 4, 128])
+                self.kernel_size, # 16
+                self.kernel_stride, # 8
+                self.block_size, # 128
+                self.topk, # 4
+                cu_seqlens, # tensor([   0, 2048], device='cuda:0', dtype=torch.int32)
+                compressed_cu_seqlens, # tensor([  0, 255], device='cuda:0', dtype=torch.int32)
+                seqlens.max().item(), # 2048
+                compressed_seqlens.max().item(), # 255
                 None,
-                self.init_blocks,
-                self.local_blocks,
+                self.init_blocks, # 1   
+                self.local_blocks, # 1
             )
+            # import pdb; pdb.set_trace()
             attn_outputs.append(compressed_attn_output)
             gate_idx += 1
 

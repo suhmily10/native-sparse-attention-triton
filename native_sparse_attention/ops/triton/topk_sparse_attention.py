@@ -284,7 +284,7 @@ def count_query(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         BLOCK_SIZE_R=BLOCK_SIZE_R,
         num_warps=4,
-        num_stages=3,
+        num_stages=2,
     )
     return active_query_count
 
@@ -842,7 +842,7 @@ def _topk_sparse_attention_fwd(
     # launch kernel
     grid = (batch_size, num_k_heads, max_seqlen_q)
     num_warps = 4 if head_dim <= 64 else 8
-    num_stages = 3
+    num_stages=2
     BLOCK_SIZE_K = triton.next_power_of_2(block_size)
     BLOCK_SIZE_D = triton.next_power_of_2(head_dim)
     BLOCK_SIZE_H = max(16, triton.next_power_of_2(num_share_q_heads))
@@ -915,7 +915,10 @@ def _topk_sparse_attention_bwd(
     BLOCK_SIZE_O = 256
     BLOCK_SIZE_D = triton.next_power_of_2(head_dim)
     num_warps = 4 if head_dim <= 64 else 8
-    num_stages = 3
+    
+    # Adjust stages to prevent shared memory overflow
+    num_stages = 1  # Reduced from 2 to save shared memory
+    
     grid = (triton.cdiv(o_len, BLOCK_SIZE_O), num_o_heads)
     backward_sum_o_do[grid](
         o,
@@ -970,10 +973,24 @@ def _topk_sparse_attention_bwd(
     )
     batch_size = cu_seqlens_q.shape[0] - 1
     num_warps = 4 if head_dim <= 64 else 8
-    num_stages = 3
+    
+    # Adjust stages to prevent shared memory overflow
+    num_stages = 1  # Reduced from 2 to save shared memory
+    
     BLOCK_SIZE_K = triton.next_power_of_2(block_size)
-    BLOCK_SIZE_Q = 128 if BLOCK_SIZE_K <= 64 else 64
+    # Adjust Q block size based on dimension to avoid shared memory issues
+    if head_dim >= 128:
+        BLOCK_SIZE_Q = 32  # Use smaller block size for large head dimensions
+    else:
+        BLOCK_SIZE_Q = 128 if BLOCK_SIZE_K <= 64 else 64
+        
     BLOCK_SIZE_D = triton.next_power_of_2(head_dim)
+    
+    # For extremely large dimensions, further reduce block sizes
+    if BLOCK_SIZE_D * BLOCK_SIZE_Q * BLOCK_SIZE_K > 200000:  # Conservative threshold
+        BLOCK_SIZE_D = BLOCK_SIZE_D // 2
+        BLOCK_SIZE_Q = min(64, BLOCK_SIZE_Q)
+    
     grid = (batch_size, num_q_heads, triton.cdiv(max_seqlen_k, BLOCK_SIZE_K))
     backward_dkdv[grid](
         q,
@@ -1034,7 +1051,7 @@ def _topk_sparse_attention_bwd(
     dq = torch.zeros_like(q)
     grid = (batch_size, num_k_heads, max_seqlen_q)
     num_warps = 4 if head_dim <= 64 else 8
-    num_stages = 3
+    num_stages=2
     BLOCK_SIZE_K = block_size
     BLOCK_SIZE_D = triton.next_power_of_2(head_dim)
     BLOCK_SIZE_H = max(16, triton.next_power_of_2(num_share_q_heads))

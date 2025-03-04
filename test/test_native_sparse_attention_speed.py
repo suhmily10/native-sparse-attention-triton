@@ -149,7 +149,7 @@ if __name__ == "__main__":
                     ("brown", "-"), ("brown", "--")],
             ylabel="ms",
             plot_name="** forward pass comparison **",
-            args={"H": 32, "D": 128},
+            args={"H": 64, "D": 192},
         )
     )
     def benchmark_forward(N, H, D, provider):
@@ -159,11 +159,11 @@ if __name__ == "__main__":
         method = '-'.join(parts[:-1])  # Join all parts except the last one
         batch_size = int(batch_info[1:])  # Extract number after 'b'
         
-        # Common parameters
-        hidden_size = H * D
-        num_q_heads = H
-        num_kv_heads = H // 8
+        # Common parameters based on paper's GQA setup
         head_dim = D
+        num_q_heads = H
+        num_kv_heads = 4  # Number of groups
+        hidden_size = num_q_heads * head_dim  # Total hidden dimension
         
         # Total sequence length = N * batch_size
         total_seqlen = N * batch_size
@@ -176,13 +176,13 @@ if __name__ == "__main__":
         sm_scale = 1 / math.sqrt(D)
         
         # Additional parameters for native-sparse
-        kernel_size = 16
-        kernel_stride = 8
-        block_size = 128
-        topk = 4
-        init_blocks = 1
-        local_blocks = 1
-        window_size = 128
+        kernel_size = 32       # 压缩块大小 l=32
+        kernel_stride = 16     # 滑动步长 d=16
+        block_size = 64        # 选择块大小 l'=64
+        topk = 16              # 选择块数 n=16
+        init_blocks = 1        # 固定初始块数
+        local_blocks = 2       # 固定局部块数
+        window_size = 512      # 滑动窗口大小 w=512
         
         quantiles = [0.5, 0.2, 0.8]
         
@@ -351,7 +351,7 @@ if __name__ == "__main__":
                     ("brown", "-"), ("brown", "--")],
             ylabel="ms",
             plot_name="** backward pass comparison **",
-            args={"H": 32, "D": 128},
+            args={"H": 64, "D": 192},
         )
     )
     def benchmark_backward(N, H, D, provider):
@@ -361,11 +361,11 @@ if __name__ == "__main__":
         method = '-'.join(parts[:-1])  # Join all parts except the last one
         batch_size = int(batch_info[1:])  # Extract number after 'b'
         
-        # Common parameters
-        hidden_size = H * D
-        num_q_heads = H
-        num_kv_heads = H // 8
+        # Common parameters based on paper's GQA setup
         head_dim = D
+        num_q_heads = H
+        num_kv_heads = 4  # Number of groups
+        hidden_size = num_q_heads * head_dim  # Total hidden dimension
         
         # Additional parameters for native-sparse
         kernel_size = 32

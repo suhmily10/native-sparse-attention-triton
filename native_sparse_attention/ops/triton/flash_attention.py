@@ -586,7 +586,7 @@ def _flash_attention_fwd(
         triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]),
     )
     num_warps = 4 if head_dim <= 64 else 8
-    num_stages = 3
+    num_stages = 1
     BLOCK_SIZE_Q = 128
     BLOCK_SIZE_K = 64
     BLOCK_SIZE_D = triton.next_power_of_2(head_dim)
@@ -650,10 +650,10 @@ def _flash_attention_bwd(
     # compute D
     delta = torch.empty([num_o_heads, o_len], device=o.device, dtype=torch.float32)
     grid = lambda META: (triton.cdiv(o_len, META["BLOCK_SIZE_O"]), num_o_heads)
-    BLOCK_SIZE_O = 256
+    BLOCK_SIZE_O = 64
     BLOCK_SIZE_D = triton.next_power_of_2(head_dim)
     num_warps = 4 if head_dim <= 64 else 8
-    num_stages = 3
+    num_stages = 1
     backward_sum_o_do[grid](
         o,
         do,
@@ -686,11 +686,11 @@ def _flash_attention_bwd(
         num_q_heads,
         triton.cdiv(max_seqlen_k, META["BLOCK_SIZE_K"]),
     )
-    num_warps = 4 if head_dim <= 64 else 8
-    num_stages = 3
-    BLOCK_SIZE_Q = 64
-    BLOCK_SIZE_K = 128
-    BLOCK_SIZE_D = triton.next_power_of_2(head_dim)
+    num_warps = 4
+    num_stages = 1
+    BLOCK_SIZE_Q = 16
+    BLOCK_SIZE_K = 16
+    BLOCK_SIZE_D = min(64, triton.next_power_of_2(head_dim))
     backward_dkdv[grid](
         q,
         k,
@@ -747,10 +747,10 @@ def _flash_attention_bwd(
         num_q_heads,
         triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]),
     )
-    num_warps = 4 if head_dim <= 64 else 8
-    num_stages = 3
-    BLOCK_SIZE_Q = 128
-    BLOCK_SIZE_K = 64
+    num_warps = 4
+    num_stages = 1
+    BLOCK_SIZE_Q = 16
+    BLOCK_SIZE_K = 16
     backward_dq[grid](
         q,
         k,
