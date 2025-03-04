@@ -1134,19 +1134,26 @@ def compressed_attention(
     )
     assert topk >= init_blocks + local_blocks
     with torch.no_grad():
-        # recompute score
-        score = _get_attention_score(
-            q,
-            k,
-            lse,
-            kernel_size,
-            kernel_stride,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
+        score = torch.empty(
+            k.shape[1],
+            q.shape[0],
             max_seqlen_k,
-            sm_scale,
+            dtype=torch.float32,
+            device=q.device,
         )
+        # recompute score
+        # score = _get_attention_score(
+        #     q,
+        #     k,
+        #     lse,
+        #     kernel_size,
+        #     kernel_stride,
+        #     cu_seqlens_q,
+        #     cu_seqlens_k,
+        #     max_seqlen_q,
+        #     max_seqlen_k,
+        #     sm_scale,
+        # )
         # transform score to block-wise score
         score = transform_score(
             score,
