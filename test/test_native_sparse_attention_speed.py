@@ -210,9 +210,30 @@ if __name__ == "__main__":
             k = torch.randn((batch_size * N, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
             v = torch.randn((batch_size * N, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
             
+            # 压缩K/V使用公共参数
+            compressed_k = []
+            compressed_v = []
+            new_cu_seqlens_k = [0]
+            for i in range(batch_size):
+                seq_start = i * N
+                seq_k = k[seq_start:seq_start+N]
+                compressed_len = (N - kernel_size) // kernel_stride + 1
+                compressed_k.append(torch.nn.functional.avg_pool1d(
+                    seq_k.permute(1,2,0), kernel_size=kernel_size, stride=kernel_stride
+                ).permute(2,0,1))
+                compressed_v.append(torch.nn.functional.avg_pool1d(
+                    v[seq_start:seq_start+N].permute(1,2,0), kernel_size=kernel_size, stride=kernel_stride
+                ).permute(2,0,1))
+                new_cu_seqlens_k.append(new_cu_seqlens_k[-1] + compressed_len)
+            
+            k = torch.cat(compressed_k, dim=0)
+            v = torch.cat(compressed_v, dim=0)
+            cu_seqlens_k = torch.tensor(new_cu_seqlens_k, device="cuda", dtype=torch.int32)
+            max_seqlen_k = (N - kernel_size) // kernel_stride + 1
+            
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: _flash_attention_fwd(
-                    q, k, v, cu_seqlens, cu_seqlens, N, N, True, sm_scale
+                    q, k, v, cu_seqlens, cu_seqlens_k, N, max_seqlen_k, True, sm_scale
                 ),
                 quantiles=quantiles,
             )
@@ -368,13 +389,13 @@ if __name__ == "__main__":
         hidden_size = num_q_heads * head_dim  # Total hidden dimension
         
         # Additional parameters for native-sparse
-        kernel_size = 32
-        kernel_stride = 16
-        block_size = 64
-        topk = 16
-        init_blocks = 1
-        local_blocks = 2
-        window_size = 512
+        kernel_size = 32       # 统一kernel参数
+        kernel_stride = 16     # 统一stride参数
+        block_size = 64        # 统一块大小
+        topk = 16              # 统一topk数
+        init_blocks = 1        # 统一初始块数
+        local_blocks = 2       # 统一局部块数
+        window_size = 512      # 统一窗口大小
         
         # Setup cu_seqlens for different batch sizes - keep sequence length fixed at N
         cu_seqlens = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
@@ -416,17 +437,39 @@ if __name__ == "__main__":
             )
             
         elif method == "triton-flash":
-            # Create inputs with proper shapes for triton-flash
+            # 使用公共参数压缩K/V
             q = torch.randn((total_seqlen, num_q_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
             k = torch.randn((total_seqlen, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
             v = torch.randn((total_seqlen, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
             
-            # Forward pass to get outputs needed for backward
-            o, lse = _flash_attention_fwd(q, k, v, cu_seqlens, cu_seqlens, N, N, True, sm_scale)
+            # 压缩K/V
+            compressed_k = []
+            compressed_v = []
+            new_cu_seqlens_k = [0]
+            for i in range(batch_size):
+                seq_start = i * N
+                seq_k = k[seq_start:seq_start+N]
+                compressed_len = (N - kernel_size) // kernel_stride + 1
+                compressed_k.append(torch.nn.functional.avg_pool1d(
+                    seq_k.permute(1,2,0), kernel_size=kernel_size, stride=kernel_stride
+                ).permute(2,0,1))
+                compressed_v.append(torch.nn.functional.avg_pool1d(
+                    v[seq_start:seq_start+N].permute(1,2,0), kernel_size=kernel_size, stride=kernel_stride
+                ).permute(2,0,1))
+                new_cu_seqlens_k.append(new_cu_seqlens_k[-1] + compressed_len)
+            
+            k = torch.cat(compressed_k, dim=0)
+            v = torch.cat(compressed_v, dim=0)
+            cu_seqlens_k = torch.tensor(new_cu_seqlens_k, device="cuda", dtype=torch.int32)
+            max_seqlen_k = (N - kernel_size) // kernel_stride + 1
+            
+            # Forward pass
+            o, lse = _flash_attention_fwd(q, k, v, cu_seqlens, cu_seqlens_k, N, max_seqlen_k, True, sm_scale)
             do = torch.randn_like(o)
             
+            # Backward pass
             ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: _flash_attention_bwd(o, do, lse, q, k, v, cu_seqlens, cu_seqlens, N, N, True, sm_scale),
+                lambda: _flash_attention_bwd(o, do, lse, q, k, v, cu_seqlens, cu_seqlens_k, N, max_seqlen_k, True, sm_scale),
                 quantiles=quantiles,
             )
             
@@ -434,14 +477,13 @@ if __name__ == "__main__":
             # All attention mechanisms enabled
             x = torch.randn((total_seqlen, hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True)
             grad_out = torch.randn((total_seqlen, hidden_size), device="cuda", dtype=torch.bfloat16)
-            
             model = setup_native_sparse_attention(
                 hidden_size=hidden_size,
                 num_q_heads=num_q_heads,
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
-                kernel_size=kernel_size,
-                kernel_stride=kernel_stride,
+                kernel_size=kernel_size,  # 使用公共参数
+                kernel_stride=kernel_stride,  # 使用公共参数
                 block_size=block_size,
                 topk=topk,
                 init_blocks=init_blocks,
