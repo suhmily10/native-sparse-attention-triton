@@ -129,13 +129,15 @@ if __name__ == "__main__":
             line_arg="provider",
             line_vals=["flash-b1", "flash-b2",
                        "triton-flash-b1", "triton-flash-b2",
+                       "triton-flash-uncomp-b1", "triton-flash-uncomp-b2",
                        "native-sparse-b1", "native-sparse-b2",
                        "nsa-compressed-b1", "nsa-compressed-b2",
                        "nsa-topk-b1", "nsa-topk-b2",
                        "nsa-sliding-b1", "nsa-sliding-b2"],
             line_names=[
                 "Flash-b1", "Flash-b2",
-                "TritonFlash-b1", "TritonFlash-b2",
+                "TritonFlash-Comp-b1", "TritonFlash-Comp-b2",
+                "TritonFlash-Uncomp-b1", "TritonFlash-Uncomp-b2",
                 "NSA-All-b1", "NSA-All-b2",
                 "NSA-Comp-b1", "NSA-Comp-b2",
                 "NSA-Topk-b1", "NSA-Topk-b2",
@@ -143,6 +145,7 @@ if __name__ == "__main__":
             ],
             styles=[("green", "-"), ("green", "--"),
                     ("red", "-"), ("red", "--"),
+                    ("cyan", "-"), ("cyan", "--"),
                     ("blue", "-"), ("blue", "--"),
                     ("purple", "-"), ("purple", "--"),
                     ("orange", "-"), ("orange", "--"),
@@ -234,6 +237,19 @@ if __name__ == "__main__":
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: _flash_attention_fwd(
                     q, k, v, cu_seqlens, cu_seqlens_k, N, max_seqlen_k, True, sm_scale
+                ),
+                quantiles=quantiles,
+            )
+            
+        elif method == "triton-flash-uncomp":
+            # Same input shape without compression
+            q = torch.randn((batch_size * N, num_q_heads, head_dim), device="cuda", dtype=torch.bfloat16)
+            k = torch.randn((batch_size * N, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
+            v = torch.randn((batch_size * N, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
+            
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: _flash_attention_fwd(
+                    q, k, v, cu_seqlens, cu_seqlens, N, N, True, sm_scale
                 ),
                 quantiles=quantiles,
             )
@@ -352,13 +368,15 @@ if __name__ == "__main__":
             line_arg="provider",
             line_vals=["flash-b1", "flash-b2",
                        "triton-flash-b1", "triton-flash-b2",
+                       "triton-flash-uncomp-b1", "triton-flash-uncomp-b2",
                        "native-sparse-b1", "native-sparse-b2",
                        "nsa-compressed-b1", "nsa-compressed-b2",
                        "nsa-topk-b1", "nsa-topk-b2",
                        "nsa-sliding-b1", "nsa-sliding-b2"],
             line_names=[
                 "Flash-b1", "Flash-b2",
-                "TritonFlash-b1", "TritonFlash-b2",
+                "TritonFlash-Comp-b1", "TritonFlash-Comp-b2",
+                "TritonFlash-Uncomp-b1", "TritonFlash-Uncomp-b2",
                 "NSA-All-b1", "NSA-All-b2",
                 "NSA-Comp-b1", "NSA-Comp-b2",
                 "NSA-Topk-b1", "NSA-Topk-b2",
@@ -366,6 +384,7 @@ if __name__ == "__main__":
             ],
             styles=[("green", "-"), ("green", "--"),
                     ("red", "-"), ("red", "--"),
+                    ("cyan", "-"), ("cyan", "--"),
                     ("blue", "-"), ("blue", "--"),
                     ("purple", "-"), ("purple", "--"),
                     ("orange", "-"), ("orange", "--"),
@@ -470,6 +489,22 @@ if __name__ == "__main__":
             # Backward pass
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: _flash_attention_bwd(o, do, lse, q, k, v, cu_seqlens, cu_seqlens_k, N, max_seqlen_k, True, sm_scale),
+                quantiles=quantiles,
+            )
+            
+        elif method == "triton-flash-uncomp":
+            # Uncompressed version for backward pass
+            q = torch.randn((total_seqlen, num_q_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            k = torch.randn((total_seqlen, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            v = torch.randn((total_seqlen, num_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            
+            # Forward pass
+            o, lse = _flash_attention_fwd(q, k, v, cu_seqlens, cu_seqlens, N, N, True, sm_scale)
+            do = torch.randn_like(o)
+            
+            # Backward pass
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: _flash_attention_bwd(o, do, lse, q, k, v, cu_seqlens, cu_seqlens, N, N, True, sm_scale),
                 quantiles=quantiles,
             )
             
