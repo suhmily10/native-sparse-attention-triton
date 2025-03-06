@@ -17,6 +17,7 @@ from native_sparse_attention.ops import (
     compressed_attention,
     topk_sparse_attention,
     conv_compress,
+    get_compressed_attention_topk,
 )
 from einops import rearrange
 from native_sparse_attention.module.rope import RopeConfig, RotaryEmbedding
@@ -82,7 +83,7 @@ class NativeSparseAttentionNoRoPE(torch.nn.Module):
 
         # gate function
         self.gate = torch.nn.Sequential(
-            torch.nn.Linear(self.hidden_size, self.num_q_heads * 3, bias=False),
+            torch.nn.Linear(self.hidden_size, self.num_q_heads * 2, bias=False),
             torch.nn.Sigmoid(),
         )
 
@@ -109,7 +110,7 @@ class NativeSparseAttentionNoRoPE(torch.nn.Module):
         k = self.proj_k(x).view(-1, self.num_kv_heads, self.head_dim)
         v = self.proj_v(x).view(-1, self.num_kv_heads, self.head_dim)
 
-        # compressed attention
+        # compressed key and value for topk selection only
         compressed_k, compressed_cu_seqlens = conv_compress(
             k,
             self.compress_key,
@@ -118,19 +119,12 @@ class NativeSparseAttentionNoRoPE(torch.nn.Module):
             self.kernel_stride,
             self.intra_block_pe,
         )
-        compressed_v, _ = conv_compress(
-            v,
-            self.compress_value,
-            cu_seqlens,
-            self.kernel_size,
-            self.kernel_stride,
-            None,
-        )
         compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
-        compressed_attn_output, topk_idx = compressed_attention(
+        
+        # get topk indices for sparse attention
+        topk_idx = get_compressed_attention_topk(
             q,
             compressed_k,
-            compressed_v,
             self.kernel_size,
             self.kernel_stride,
             self.block_size,
@@ -164,11 +158,10 @@ class NativeSparseAttentionNoRoPE(torch.nn.Module):
 
         # gate average
         gate = self.gate(x)
-        gate = rearrange(gate, "n (h g) -> n h g", g=3)
+        gate = rearrange(gate, "n (h g) -> n h g", g=2)
         attn_output = (
-            gate[..., 0:1] * compressed_attn_output
-            + gate[..., 1:2] * sparse_attn_output
-            + gate[..., 2:3] * sliding_attn_output
+            gate[..., 0:1] * sparse_attn_output
+            + gate[..., 1:2] * sliding_attn_output
         )
 
         # rearrange and output proj
@@ -240,7 +233,7 @@ class NativeSparseAttention(torch.nn.Module):
 
         # gate function
         self.gate = torch.nn.Sequential(
-            torch.nn.Linear(self.hidden_size, self.num_q_heads * 3, bias=False),
+            torch.nn.Linear(self.hidden_size, self.num_q_heads * 2, bias=False),
             torch.nn.Sigmoid(),
         )
 
@@ -270,7 +263,7 @@ class NativeSparseAttention(torch.nn.Module):
         k = self.proj_k(x).view(-1, self.num_kv_heads, self.head_dim)
         v = self.proj_v(x).view(-1, self.num_kv_heads, self.head_dim)
 
-        # compressed key and value before rope
+        # compressed key before rope for topk selection only
         compressed_k, compressed_cu_seqlens = conv_compress(
             k,
             self.compress_key,
@@ -279,27 +272,18 @@ class NativeSparseAttention(torch.nn.Module):
             self.kernel_stride,
             self.intra_block_pe,
         )
-        compressed_v, _ = conv_compress(
-            v,
-            self.compress_value,
-            cu_seqlens,
-            self.kernel_size,
-            self.kernel_stride,
-            None,
-        )
+        compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
 
         # do rope for query and compressed key
         q = self.rope(q, cu_seqlens)
         compressed_k = self.rope(
             compressed_k, compressed_cu_seqlens, start=0, stride=self.kernel_stride
         )
-
-        # attention between query and compressed key value
-        compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
-        compressed_attn_output, topk_idx = compressed_attention(
+        
+        # get topk indices for sparse attention
+        topk_idx = get_compressed_attention_topk(
             q,
             compressed_k,
-            compressed_v,
             self.kernel_size,
             self.kernel_stride,
             self.block_size,
@@ -336,11 +320,10 @@ class NativeSparseAttention(torch.nn.Module):
 
         # gate average
         gate = self.gate(x)
-        gate = rearrange(gate, "n (h g) -> n h g", g=3)
+        gate = rearrange(gate, "n (h g) -> n h g", g=2)
         attn_output = (
-            gate[..., 0:1] * compressed_attn_output
-            + gate[..., 1:2] * sparse_attn_output
-            + gate[..., 2:3] * sliding_attn_output
+            gate[..., 0:1] * sparse_attn_output
+            + gate[..., 1:2] * sliding_attn_output
         )
 
         # rearrange and output proj

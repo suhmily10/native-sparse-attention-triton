@@ -1179,3 +1179,108 @@ def compressed_attention(
         topk_idx[topk_idx > q_idx[None, :, None]] = -1
         topk_idx = topk_idx.to(torch.int32)
     return attn_output, topk_idx
+
+
+def get_compressed_attention_topk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    kernel_size: int,
+    kernel_stride: int,
+    block_size: int,
+    topk: int,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int = None,
+    max_seqlen_k: int = None,
+    sm_scale: float = None,
+    init_blocks: int = 1,
+    local_blocks: int = 2,
+) -> torch.Tensor:
+    """Compute topk block indices for compressed attention based on q*k scores.
+    
+    Args:
+        q (torch.Tensor): shape [total_q_len, num_q_heads, head_dim]
+        k (torch.Tensor): shape [total_kv_len, num_kv_heads, head_dim]
+        kernel_size (int): kernel size in compress_key_value
+        kernel_stride (int): stride of compress_key_value
+        block_size (int): key value block size for topk sparse attention
+        topk (int): number of blocks for each query
+        cu_seqlens_q (torch.Tensor): shape [batch_size + 1], cumulative sequence lengths for queries
+        cu_seqlens_k (torch.Tensor): shape [batch_size + 1], cumulative sequence lengths for keys
+        max_seqlen_q (int, optional): max q len of the batch. Defaults to None.
+        max_seqlen_k (int, optional): max k len of the batch. Defaults to None.
+        sm_scale (float, optional): softmax scale. Defaults to None, means 1/sqrt(head_dim).
+        init_blocks (int, optional): Number of init blocks for each query. Defaults to 1.
+        local_blocks (int, optional): Number of local blocks for each query. Defaults to 2.
+        
+    Returns:
+        torch.Tensor: topk_idx used in topk_sparse_attention
+    """
+    # Handle None values for max sequence lengths
+    if max_seqlen_q is None:
+        max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+    if max_seqlen_k is None:
+        max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
+    
+    # Check if topk is valid
+    if topk <= 0:
+        warnings.warn("topk <= 0, returned topk_idx will be None")
+        return None
+    
+    # Set default scale if not provided
+    if sm_scale is None:
+        sm_scale = 1 / math.sqrt(q.shape[-1])
+    
+    # Create dummy lse tensor for score computation
+    # We don't need accurate values since we only care about relative ordering for topk
+    dummy_lse = torch.zeros(
+        (q.shape[1], q.shape[0]),
+        dtype=torch.float32, 
+        device=q.device
+    )
+    
+    with torch.no_grad():
+        # Compute attention scores
+        score = _get_attention_score(
+            q,
+            k,
+            dummy_lse,
+            kernel_size,
+            kernel_stride,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            sm_scale,
+        )
+        
+        # Transform score to block-wise score
+        score = transform_score(
+            score,
+            kernel_size,
+            kernel_stride,
+            block_size,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            init_blocks,
+            local_blocks,
+        )
+        
+        # Get topk indices
+        batch_size = cu_seqlens_q.shape[0] - 1
+        q_idx = torch.cat(
+            [
+                torch.arange(cu_seqlens_q[i + 1] - cu_seqlens_q[i], device=q.device)
+                for i in range(batch_size)
+            ],
+            dim=0,
+        )
+        q_idx = q_idx // block_size
+        topk = min(topk, score.shape[-1])
+        topk_idx = score.topk(topk, dim=-1).indices.sort(-1).values
+        topk_idx[topk_idx > q_idx[None, :, None]] = -1
+        topk_idx = topk_idx.to(torch.int32)
+        
+    return topk_idx
