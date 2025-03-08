@@ -58,20 +58,22 @@ def topk_sparse_attention_flash(
     # Initialize the output tensor
     o = torch.zeros_like(q)
     
-    # Process all heads and queries in parallel
+    # Process all KV heads
     for h_kv in range(num_kv_heads):
         # Get all valid blocks for this head
         head_topk_idx = topk_idx[h_kv]  # [total_len, topk]
         
+        # Get corresponding q heads for this kv head
+        q_heads_slice = slice(h_kv * num_share_q_heads, (h_kv + 1) * num_share_q_heads)
+        
         # Find all valid queries and their corresponding blocks
-        # A query is valid if it has at least one valid block to attend to
         valid_q_mask = (head_topk_idx != -1).any(dim=1)  # [total_len]
         if not valid_q_mask.any():
             continue
         
         valid_q_indices = torch.nonzero(valid_q_mask, as_tuple=True)[0]  # [num_valid_queries]
         
-        # For each valid query, gather its corresponding keys and values
+        # Process each batch separately
         for batch_idx in range(batch_size):
             batch_start = cu_seqlens[batch_idx].item()
             batch_end = cu_seqlens[batch_idx + 1].item()
@@ -82,10 +84,11 @@ def topk_sparse_attention_flash(
                 continue
             
             batch_q_indices = valid_q_indices[batch_mask]  # [num_valid_batch_queries]
-            batch_q = q[batch_q_indices, h_kv*num_share_q_heads:(h_kv+1)*num_share_q_heads]  # [num_valid_batch_queries, num_share_q_heads, head_dim]
             
-            # For each query in batch, collect all keys it should attend to
-            for q_idx, global_q_idx in enumerate(batch_q_indices):
+            # Process all valid queries in this batch in parallel
+            batch_q = q[batch_q_indices][:, q_heads_slice]  # [num_valid_batch_queries, num_share_q_heads, head_dim]
+            
+            for i, global_q_idx in enumerate(batch_q_indices):
                 local_q_idx = global_q_idx - batch_start
                 
                 # Get blocks for this query
@@ -108,21 +111,21 @@ def topk_sparse_attention_flash(
                 # Get actual key indices
                 key_indices = batch_start + torch.nonzero(key_mask, as_tuple=True)[0]
                 
-                # Collect keys and values
+                # Collect keys and values for the current KV head
                 k_selected = k[key_indices, h_kv]  # [num_keys, head_dim]
                 v_selected = v[key_indices, h_kv]  # [num_keys, head_dim]
                 
-                # Reshape for batch matrix multiplication
-                q_current = batch_q[q_idx]  # [num_share_q_heads, head_dim]
+                # Use the current query with all the related query heads
+                q_current = batch_q[i]  # [num_share_q_heads, head_dim]
                 
-                # Calculate attention scores - more efficient batched version
+                # Calculate attention scores for all query heads at once
                 attn_scores = torch.matmul(q_current, k_selected.transpose(0, 1)) * softmax_scale  # [num_share_q_heads, num_keys]
                 
-                # Apply softmax and compute weighted sum
+                # Apply softmax and compute weighted sum for all heads at once
                 attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
                 attn_output = torch.matmul(attn_weights, v_selected)  # [num_share_q_heads, head_dim]
                 
-                # Store the result
-                o[global_q_idx, h_kv*num_share_q_heads:(h_kv+1)*num_share_q_heads] = attn_output
+                # Store the result for all query heads
+                o[global_q_idx, q_heads_slice] = attn_output
     
     return o
