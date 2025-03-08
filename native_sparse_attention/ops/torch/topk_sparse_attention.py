@@ -69,7 +69,7 @@ def topk_sparse_attention_torch(
                             + topk_idx[h, start + j, t] * block_size : start
                             + (topk_idx[h, start + j, t] + 1) * block_size,
                         ] = True
-    mask = torch.tril(mask).repeat_interleave(num_share_q_heads, 0)
+    mask = mask.repeat_interleave(num_share_q_heads, 0)
     # qk attn
     qk = (
         torch.einsum("qhd,khd->hqk", q, k.repeat_interleave(num_share_q_heads, 1))
