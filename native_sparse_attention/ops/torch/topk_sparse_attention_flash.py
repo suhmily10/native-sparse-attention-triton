@@ -68,9 +68,6 @@ def topk_sparse_attention_flash(
             # Gather the relevant keys and values for this batch and head
             batch_topk_idx = topk_idx[h_kv, start:end]  # [batch_len, topk]
             
-            # Create a sparse qk attention matrix
-            q_batch = q[start:end, h_kv*num_share_q_heads:(h_kv+1)*num_share_q_heads]  # [batch_len, num_share_q_heads, head_dim]
-            
             # For each query position, compute attention with its selected key blocks
             for j in range(batch_len):
                 valid_indices = batch_topk_idx[j] != -1
@@ -78,30 +75,35 @@ def topk_sparse_attention_flash(
                     continue
                 
                 valid_block_indices = batch_topk_idx[j, valid_indices]
-                block_offsets = valid_block_indices * block_size
                 
-                # Expand block indices to get individual key indices
-                key_indices = []
-                for block_idx in block_offsets:
-                    block_start = start + block_idx
-                    block_end = min(block_start + block_size, end)
-                    key_indices.append(torch.arange(block_start, block_end, device=q.device))
+                # Create a mask for all keys in this sequence
+                key_mask = torch.zeros(batch_len, dtype=torch.bool, device=q.device)
                 
-                if not key_indices:  # Skip if no valid blocks
+                # Fill in the mask for each valid block
+                for block_idx in valid_block_indices:
+                    block_start = block_idx * block_size
+                    block_end = min(block_start + block_size, batch_len)
+                    if block_start < batch_len:
+                        key_mask[block_start:block_end] = True
+                
+                if not key_mask.any():
                     continue
                 
-                key_indices = torch.cat(key_indices)
+                # Get indices of keys to attend to
+                key_indices = start + torch.nonzero(key_mask, as_tuple=True)[0]
                 
                 # Get the keys and values for these indices
                 k_selected = k[key_indices, h_kv].unsqueeze(0)  # [1, num_keys, head_dim]
                 v_selected = v[key_indices, h_kv].unsqueeze(0)  # [1, num_keys, head_dim]
                 
-                # Compute attention for this query
+                # Compute attention for this query across all heads that share this kv head
                 q_j = q[start + j, h_kv*num_share_q_heads:(h_kv+1)*num_share_q_heads]  # [num_share_q_heads, head_dim]
                 
                 # Calculate attention scores
                 attn_scores = torch.matmul(q_j, k_selected.transpose(-1, -2)) * softmax_scale  # [num_share_q_heads, num_keys]
-                attn_weights = torch.softmax(attn_scores, dim=-1)
+                
+                # Apply softmax in float32 for numerical stability, then convert back
+                attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
                 
                 # Apply attention weights to values
                 attn_output = torch.matmul(attn_weights, v_selected)  # [num_share_q_heads, head_dim]
