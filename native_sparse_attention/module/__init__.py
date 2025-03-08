@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from native_sparse_attention.module.native_sparse_attention import (
-    NativeSparseAttentionNoRoPE,
-    NativeSparseAttention,
+    NativeSparseAttentionQKV,
 )
 from native_sparse_attention.module.rope import RotaryEmbedding, RopeConfig

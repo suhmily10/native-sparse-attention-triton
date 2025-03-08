@@ -18,7 +18,7 @@ import time
 from flash_attn import flash_attn_varlen_func
 from native_sparse_attention.ops.triton.flash_attention import flash_attention_varlen
 from native_sparse_attention.ops.torch.compress_key_value import avgpool_compress
-from native_sparse_attention.module.native_sparse_attention import NativeSparseAttentionNoRoPE, NativeSparseAttentionQKV
+from native_sparse_attention.module.native_sparse_attention import  NativeSparseAttentionQKV
 from native_sparse_attention.module.rope import RopeConfig
 
 def bench(func, warmup_steps=3, test_steps=10):
@@ -41,18 +41,18 @@ def benchmark_forward_backward():
             line_arg="provider",
             line_vals=[
                 "flash-forward",
-                "triton-flash-forward",
+                # "triton-flash-forward",
                 "nsa-forward",
                 "flash-backward",
-                "triton-flash-backward",
+                # "triton-flash-backward",
                 "nsa-backward",
             ],
             line_names=[
                 "Flash Forward",
-                "Triton-Flash Forward",
+                # "Triton-Flash Forward",
                 "NSA Forward",
                 "Flash Backward",
-                "Triton-Flash Backward",
+                # "Triton-Flash Backward",
                 "NSA Backward",
             ],
             styles=[
@@ -90,7 +90,7 @@ def benchmark_forward_backward():
         topk = 16
         init_blocks = 8
         local_blocks = 4
-        window_size = 256
+        window_size = 128
 
         # Initialize NSA model (QKV version for direct comparison)
         nsa_qkv = NativeSparseAttentionQKV(
@@ -107,20 +107,7 @@ def benchmark_forward_backward():
             window_size=window_size,
         ).cuda().to(torch.bfloat16)
         
-        # Also keep the original NSA for complete comparison
-        nsa = NativeSparseAttentionNoRoPE(
-            hidden_size=hidden_size,
-            num_q_heads=H,
-            num_kv_heads=num_kv_heads,
-            head_dim=D,
-            kernel_size=kernel_size,
-            kernel_stride=kernel_stride,
-            block_size=block_size,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-            window_size=window_size,
-        ).cuda().to(torch.bfloat16)
+
         
         # Pre-computation for NSA
         x_clone = x.detach().clone().requires_grad_(True)
@@ -222,7 +209,7 @@ def benchmark_forward_backward():
                 
                 # First run to warm up and create graph
                 o = nsa_qkv(q_back, k_back, v_back, cu_seqlens)
-                loss = (o * grad_output).sum()
+                loss = (o * grad_output_attn).sum()
                 
                 # Only time the backward pass
                 ms = bench(
@@ -232,7 +219,7 @@ def benchmark_forward_backward():
                 max_ms = ms
         finally:
             # Clean up all tensors
-            del x, cu_seqlens, q, k, v, x_clone, grad_output, grad_output_attn, nsa, nsa_qkv
+            del x, cu_seqlens, q, k, v, x_clone, grad_output, grad_output_attn, nsa_qkv
             # Force garbage collection before emptying cache
             import gc
             gc.collect()
@@ -250,18 +237,18 @@ def benchmark_batch_sizes():
             line_arg="provider",
             line_vals=[
                 "flash-forward",
-                "triton-flash-forward",
+                # "triton-flash-forward",
                 "nsa-forward",
                 "flash-backward",
-                "triton-flash-backward",
+                # "triton-flash-backward",
                 "nsa-backward",
             ],
             line_names=[
                 "Flash Forward",
-                "Triton-Flash Forward", 
+                # "Triton-Flash Forward", 
                 "NSA Forward",
                 "Flash Backward",
-                "Triton-Flash Backward",
+                # "Triton-Flash Backward",
                 "NSA Backward",
             ],
             styles=[
@@ -326,19 +313,6 @@ def benchmark_batch_sizes():
         ).cuda().to(torch.bfloat16)
         
         # Also keep the original NSA
-        nsa = NativeSparseAttentionNoRoPE(
-            hidden_size=hidden_size,
-            num_q_heads=H,
-            num_kv_heads=num_kv_heads,
-            head_dim=D,
-            kernel_size=kernel_size,
-            kernel_stride=kernel_stride,
-            block_size=block_size,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-            window_size=window_size,
-        ).cuda().to(torch.bfloat16)
         
         # Pre-computation for NSA
         x_flat = x.reshape(-1, hidden_size)
@@ -472,7 +446,7 @@ def benchmark_batch_sizes():
                 
                 # First run to warm up and create graph
                 o = nsa_qkv(q_back, k_back, v_back, cu_seqlens)
-                loss = (o * grad_output).sum()
+                loss = (o * grad_output_attn).sum()
                 
                 # Only time the backward pass
                 ms = bench(
@@ -486,7 +460,7 @@ def benchmark_batch_sizes():
                 torch.cuda.empty_cache()
         finally:
             # Clean up all tensors
-            del x, cu_seqlens, q, k, v, x_clone, grad_output, grad_output_attn, nsa, nsa_qkv, x_flat
+            del x, cu_seqlens, q, k, v, x_clone, grad_output, grad_output_attn, nsa_qkv, x_flat
             # Force garbage collection before emptying cache
             import gc
             gc.collect()

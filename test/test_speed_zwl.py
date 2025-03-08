@@ -33,7 +33,7 @@ def stage1_func(q, k, v):
 
     return stage_1_output, topk
 
-def stage2_func(q, k, v, topk):
+def stage2_func(q, k, v, topk): 
     pass
 
 
