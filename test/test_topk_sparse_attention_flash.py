@@ -91,17 +91,17 @@ if __name__ == "__main__":
     q = (
         torch.empty(cu_seqlens[-1], 32, 96, device="cuda")
         .uniform_(-1, 1)
-        .to(torch.float16)
+        .to(torch.float)
     )
     k = (
         torch.empty(cu_seqlens[-1], 4, 96, device="cuda")
         .uniform_(-1, 1)
-        .to(torch.float16)
+        .to(torch.float32)
     )
     v = (
         torch.empty(cu_seqlens[-1], 4, 96, device="cuda")
         .uniform_(-1, 1)
-        .to(torch.float16)
+        .to(torch.float32)
     )
     q.requires_grad = True
     k.requires_grad = True

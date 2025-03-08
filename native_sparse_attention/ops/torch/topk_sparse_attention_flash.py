@@ -40,7 +40,7 @@ def topk_sparse_attention_flash(
         torch.Tensor: attention output, shape [total_len, num_q_heads, head_dim]
     """
     total_seqlen, num_q_heads, head_dim = q.shape
-    total_seqlen, num_kv_heads, head_dim = k.shape
+    _, num_kv_heads, _ = k.shape
     num_share_q_heads = num_q_heads // num_kv_heads
     batch_size = cu_seqlens.shape[0] - 1
     topk = topk_idx.shape[-1]
@@ -58,57 +58,71 @@ def topk_sparse_attention_flash(
     # Initialize the output tensor
     o = torch.zeros_like(q)
     
-    # Process each batch and head separately
-    for i in range(batch_size):
-        start = cu_seqlens[i].item()
-        end = cu_seqlens[i + 1].item()
-        batch_len = end - start
+    # Process all heads and queries in parallel
+    for h_kv in range(num_kv_heads):
+        # Get all valid blocks for this head
+        head_topk_idx = topk_idx[h_kv]  # [total_len, topk]
         
-        for h_kv in range(num_kv_heads):
-            # Gather the relevant keys and values for this batch and head
-            batch_topk_idx = topk_idx[h_kv, start:end]  # [batch_len, topk]
+        # Find all valid queries and their corresponding blocks
+        # A query is valid if it has at least one valid block to attend to
+        valid_q_mask = (head_topk_idx != -1).any(dim=1)  # [total_len]
+        if not valid_q_mask.any():
+            continue
+        
+        valid_q_indices = torch.nonzero(valid_q_mask, as_tuple=True)[0]  # [num_valid_queries]
+        
+        # For each valid query, gather its corresponding keys and values
+        for batch_idx in range(batch_size):
+            batch_start = cu_seqlens[batch_idx].item()
+            batch_end = cu_seqlens[batch_idx + 1].item()
             
-            # For each query position, compute attention with its selected key blocks
-            for j in range(batch_len):
-                valid_indices = batch_topk_idx[j] != -1
-                if not valid_indices.any():
+            # Find valid queries in this batch
+            batch_mask = (valid_q_indices >= batch_start) & (valid_q_indices < batch_end)
+            if not batch_mask.any():
+                continue
+            
+            batch_q_indices = valid_q_indices[batch_mask]  # [num_valid_batch_queries]
+            batch_q = q[batch_q_indices, h_kv*num_share_q_heads:(h_kv+1)*num_share_q_heads]  # [num_valid_batch_queries, num_share_q_heads, head_dim]
+            
+            # For each query in batch, collect all keys it should attend to
+            for q_idx, global_q_idx in enumerate(batch_q_indices):
+                local_q_idx = global_q_idx - batch_start
+                
+                # Get blocks for this query
+                q_blocks = head_topk_idx[global_q_idx]
+                valid_blocks = q_blocks[q_blocks != -1]
+                
+                if valid_blocks.numel() == 0:
                     continue
                 
-                valid_block_indices = batch_topk_idx[j, valid_indices]
+                # Create key mask for all valid blocks
+                key_mask = torch.zeros(batch_end - batch_start, dtype=torch.bool, device=q.device)
                 
-                # Create a mask for all keys in this sequence
-                key_mask = torch.zeros(batch_len, dtype=torch.bool, device=q.device)
-                
-                # Fill in the mask for each valid block
-                for block_idx in valid_block_indices:
+                # Fill in mask for each valid block
+                for block_idx in valid_blocks:
                     block_start = block_idx * block_size
-                    block_end = min(block_start + block_size, batch_len)
-                    if block_start < batch_len:
+                    block_end = min((block_idx + 1) * block_size, batch_end - batch_start)
+                    if block_start < batch_end - batch_start:
                         key_mask[block_start:block_end] = True
                 
-                if not key_mask.any():
-                    continue
+                # Get actual key indices
+                key_indices = batch_start + torch.nonzero(key_mask, as_tuple=True)[0]
                 
-                # Get indices of keys to attend to
-                key_indices = start + torch.nonzero(key_mask, as_tuple=True)[0]
+                # Collect keys and values
+                k_selected = k[key_indices, h_kv]  # [num_keys, head_dim]
+                v_selected = v[key_indices, h_kv]  # [num_keys, head_dim]
                 
-                # Get the keys and values for these indices
-                k_selected = k[key_indices, h_kv].unsqueeze(0)  # [1, num_keys, head_dim]
-                v_selected = v[key_indices, h_kv].unsqueeze(0)  # [1, num_keys, head_dim]
+                # Reshape for batch matrix multiplication
+                q_current = batch_q[q_idx]  # [num_share_q_heads, head_dim]
                 
-                # Compute attention for this query across all heads that share this kv head
-                q_j = q[start + j, h_kv*num_share_q_heads:(h_kv+1)*num_share_q_heads]  # [num_share_q_heads, head_dim]
+                # Calculate attention scores - more efficient batched version
+                attn_scores = torch.matmul(q_current, k_selected.transpose(0, 1)) * softmax_scale  # [num_share_q_heads, num_keys]
                 
-                # Calculate attention scores
-                attn_scores = torch.matmul(q_j, k_selected.transpose(-1, -2)) * softmax_scale  # [num_share_q_heads, num_keys]
-                
-                # Apply softmax in float32 for numerical stability, then convert back
+                # Apply softmax and compute weighted sum
                 attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
-                
-                # Apply attention weights to values
                 attn_output = torch.matmul(attn_weights, v_selected)  # [num_share_q_heads, head_dim]
                 
-                # Store the output
-                o[start + j, h_kv*num_share_q_heads:(h_kv+1)*num_share_q_heads] = attn_output
+                # Store the result
+                o[global_q_idx, h_kv*num_share_q_heads:(h_kv+1)*num_share_q_heads] = attn_output
     
     return o
