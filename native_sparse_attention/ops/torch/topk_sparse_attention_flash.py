@@ -68,9 +68,10 @@ def topk_sparse_attention_flash(
     num_kv_head = topk_idx.shape[0]
     softmax_scale = softmax_scale or head_dim ** (-0.5)
     
-    # 直接从topk_idx提取唯一块索引 (减少中间变量)
-    unique_chunks = topk_idx.reshape(-1)[topk_idx.reshape(-1) >= 0].unique()
-    num_chunk = len(unique_chunks)
+    # 高效地提取唯一块索引，减少内存占用
+    mask = topk_idx >= 0
+    unique_chunks = torch.unique(torch.masked_select(topk_idx, mask))
+    num_chunk = unique_chunks.size(0)
     
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"Found {num_chunk} unique chunk indices")

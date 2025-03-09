@@ -70,7 +70,7 @@ def generate_topk_idx_example(
         ]
         topk_idx = [
             torch.nn.functional.pad(
-                topk_idx[i], (0, topk - topk_idx[i].shape[-1]), value=topk
+                topk_idx[i], (0, topk - topk_idx[i].shape[-1]), value=-1
             )
             for i in range(batch_size)
         ]
@@ -368,5 +368,102 @@ if __name__ == "__main__":
     logger.debug("Starting backward benchmark runs")
     benchmark_backward.run(show_plots=True, print_data=True)
     logger.debug("Completed backward benchmark runs and script execution")
+
+    # benchmark batch sizes with fixed sequence length
+    logger.debug("Setting up batch size benchmark")
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["B"],  # Test different batch sizes
+            x_vals=[1,2,4,8,16],
+            line_arg="provider",
+            line_vals=[
+                "flash", 
+                "topk-flash"
+            ],
+            line_names=[
+                "Flash",
+                "TopK-Flash",
+            ],
+            styles=[("green", "-"), ("blue", "-")],
+            ylabel="ms",
+            plot_name="** batch size performance comparison 8192 **",
+            args={"N": 4096, "H": 8, "D": 96},  # Fixed sequence length
+        )
+    )
+    def benchmark_batch_sizes(B, N, H, D, provider):
+        logger.debug(f"Batch size benchmark: B={B}, N={N}, H={H}, D={D}, provider={provider}")
+        
+        # Clear CUDA cache before creating new tensors
+        torch.cuda.empty_cache()
+        logger.debug(f"Starting benchmark B={B}, provider={provider}, memory: {torch.cuda.memory_reserved()//1024**3} GB")
+        
+        # Total number of tokens across all batches
+        total_tokens = B * N
+        
+        # Create cumulative sequence lengths for batched input
+        cu_seqlens = torch.zeros(B+1, device="cuda", dtype=torch.int32)
+        for i in range(B):
+            cu_seqlens[i+1] = cu_seqlens[i] + N
+        
+        sm_scale = 1 / math.sqrt(D)
+        
+        # Create input tensors
+        q = torch.randn((total_tokens, H, D), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn((total_tokens, H // 2, D), device="cuda", dtype=torch.bfloat16)
+        v = torch.randn((total_tokens, H // 2, D), device="cuda", dtype=torch.bfloat16)
+        
+        # Parameters for topk sparse attention
+        block_size = 256
+        topk = 4
+        
+        # Generate topk indices for sparse attention
+        top_idx = generate_topk_idx_example(torch.ones(B, device="cuda", dtype=torch.int32) * N, 
+                                            block_size, topk, H // 2)
+        
+        try:
+            if provider == "flash":
+                logger.debug(f"Running flash-attention benchmark with B={B}, N={N}")
+                start_time = time.time()
+                ms = bench(
+                    lambda: _flash_attn_varlen_forward(
+                        q,
+                        k,
+                        v,
+                        cu_seqlens,
+                        cu_seqlens,
+                        total_tokens,
+                        total_tokens,
+                        dropout_p=0.0,
+                        causal=True,
+                        softmax_scale=sm_scale,
+                    )
+                )
+                min_ms = ms
+                max_ms = ms
+                logger.debug(f"Completed flash-attention benchmark in {time.time() - start_time:.2f}s")
+                
+            elif provider == "topk-flash":
+                logger.debug(f"Running topk-flash-attention benchmark with B={B}, N={N}")
+                start_time = time.time()
+                ms = bench(
+                    lambda: topk_sparse_attention_flash(
+                        q, k, v, top_idx, block_size, cu_seqlens, sm_scale
+                    )
+                )
+                min_ms = ms
+                max_ms = ms
+                logger.debug(f"Completed topk-flash-attention benchmark in {time.time() - start_time:.2f}s")
+        finally:
+            # Clean up all tensors
+            del q, k, v, cu_seqlens, top_idx
+            # Force garbage collection before emptying cache
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+        return ms, min_ms, max_ms
+
+    logger.debug("Starting batch size benchmark runs")
+    benchmark_batch_sizes.run(show_plots=True, print_data=True)
+    logger.debug("Completed batch size benchmark runs")
 
  
