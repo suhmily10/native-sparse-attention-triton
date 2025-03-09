@@ -51,8 +51,7 @@ def topk_sparse_attention_torch(
     q_idx = torch.cat(
         [torch.arange(seqlens[i], device="cuda") for i in range(batch_size)], dim=0
     )
-    topk_idx[topk_idx > (q_idx // block_size)[None, :, None]] = -1
-    # get mask
+
     mask = torch.zeros(
         (num_kv_heads, total_seqlen, total_seqlen), dtype=torch.bool, device=q.device
     )

@@ -14,6 +14,11 @@
 import torch
 import math
 from typing import Optional
+from flash_attn import flash_attn_varlen_func
+from flash_attn.flash_attn_interface import (
+    _flash_attn_varlen_forward,
+    _flash_attn_varlen_backward,
+)
 
 
 def topk_sparse_attention_flash(
@@ -43,7 +48,7 @@ def topk_sparse_attention_flash(
     _, num_kv_heads, _ = k.shape
     num_share_q_heads = num_q_heads // num_kv_heads
     batch_size = cu_seqlens.shape[0] - 1
-
+    topk = topk_idx.shape[-1]
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     
@@ -52,73 +57,57 @@ def topk_sparse_attention_flash(
     # Initialize the output tensor
     o = torch.zeros_like(q)
     
-    # Process each KV head
-    for h_kv in range(num_kv_heads):
-        # Get corresponding q heads for this kv head
-        q_heads_slice = slice(h_kv * num_share_q_heads, (h_kv + 1) * num_share_q_heads)
-        q_heads = q[:, q_heads_slice]  # [total_len, num_share_q_heads, head_dim]
-        
-        # Get all blocks for this head
-        head_topk_idx = topk_idx[h_kv]  # [total_len, topk]
-        
-        # Create a mask of valid blocks (non-padding)
-        valid_block_mask = head_topk_idx != -1  # [total_len, topk]
-        
-        # Skip if no valid blocks for this head
-        if not valid_block_mask.any():
-            continue
-        
-        # Find which batch each query belongs to
-        batch_indices = torch.zeros(total_seqlen, dtype=torch.long, device=q.device)
-        for b in range(batch_size):
-            batch_indices[cu_seqlens[b]:cu_seqlens[b+1]] = b
-        
-        # Gather all valid q positions and their corresponding block indices
-        q_positions, block_positions = torch.nonzero(valid_block_mask, as_tuple=True)
-        
-        # Unique query positions (each query may attend to multiple blocks)
-        unique_q_positions, q_counts = torch.unique(q_positions, return_counts=True)
-        
-        # Get the valid block indices
-        valid_block_indices = head_topk_idx[q_positions, block_positions]
-        
-        # Process q positions in batches
-        start_idx = 0
-        for q_pos in unique_q_positions:
-            # Get batch info for this query
-            batch_idx = batch_indices[q_pos]
-            batch_start = cu_seqlens[batch_idx].item()
-            
-            # Get all block indices for this query position
-            count = q_counts[unique_q_positions == q_pos].item()
-            q_block_indices = valid_block_indices[start_idx:start_idx+count]
-            start_idx += count
-            
-            # Calculate key indices for all blocks
-            key_indices = []
-            for block_idx in q_block_indices:
-                block_start = batch_start + block_idx * block_size
-                block_end = min(batch_start + (block_idx + 1) * block_size, cu_seqlens[batch_idx + 1])
-                key_indices.extend(range(block_start, block_end))
-            
-            if not key_indices:
-                continue
-                
-            key_indices = torch.tensor(key_indices, device=q.device)
-            
-            # Extract keys and values
-            k_selected = k[key_indices, h_kv]  # [num_keys, head_dim]
-            v_selected = v[key_indices, h_kv]  # [num_keys, head_dim]
-            
-            # Calculate attention scores
-            q_current = q_heads[q_pos]  # [num_share_q_heads, head_dim]
-            attn_scores = torch.matmul(q_current, k_selected.transpose(0, 1)) * softmax_scale
-            
-            # Apply softmax and compute weighted sum
-            attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
-            attn_output = torch.matmul(attn_weights, v_selected)
-            
-            # Store the result
-            o[q_pos, q_heads_slice] = attn_output
+    # 生成块掩码并重组张量
+    batch_indices = torch.repeat_interleave(
+        torch.arange(batch_size, device=q.device),
+        cu_seqlens[1:] - cu_seqlens[:-1]
+    )
     
-    return o
+    # 生成块偏移量 [batch_size, max_blocks+1]
+    max_blocks = (cu_seqlens[1:] - cu_seqlens[:-1] + block_size - 1) // block_size
+    block_offsets = torch.cat([torch.zeros(1, device=q.device)] + [
+        torch.arange(0, seqlen, block_size, device=q.device) 
+        for seqlen in (cu_seqlens[1:] - cu_seqlens[:-1])
+    ])
+    
+    # 重组KV数据 [num_blocks, num_kv_heads, block_size, head_dim]
+    k_blocks = k.unfold(0, block_size, block_size)
+    v_blocks = v.unfold(0, block_size, block_size)
+    
+    # 根据topk_idx选择块 [num_kv_heads, total_len, topk] -> [num_kv_heads, total_len*topk]
+    valid_mask = topk_idx != -1
+    selected_blocks = topk_idx[valid_mask]
+    
+    # 修正后的批次索引扩展方式
+    batch_expanded = batch_indices.unsqueeze(0).unsqueeze(-1).expand_as(topk_idx)[valid_mask]
+    
+    # 计算实际块索引
+    block_starts = block_offsets[batch_expanded] + selected_blocks * block_size
+    block_indices = (block_starts.unsqueeze(-1) + torch.arange(block_size, device=q.device)).long()
+    
+    # 收集选中的KV块 [num_selected_blocks, num_kv_heads, block_size, head_dim]
+    k_selected = k[block_indices.clamp_max(k.size(0)-1)]
+    v_selected = v[block_indices.clamp_max(v.size(0)-1)]
+    
+    import pdb; pdb.set_trace()
+    # 重组为批量计算形状 [num_kv_heads, total_len, topk, block_size, head_dim]
+    k_selected = k_selected.view(num_kv_heads, total_seqlen, topk, block_size, head_dim)
+    v_selected = v_selected.view(num_kv_heads, total_seqlen, topk, block_size, head_dim)
+    
+    # 扩展Q张量用于批量计算 [num_kv_heads, total_len, num_share_q_heads, head_dim]
+    q_expanded = q.view(total_seqlen, num_kv_heads, num_share_q_heads, head_dim)
+    
+    # 批量计算注意力分数 [num_kv_heads, total_len, num_share_q_heads, topk*block_size]
+    import pdb; pdb.set_trace()
+    attn_scores = torch.einsum(
+        'lkhd,lknhd->lnhk', 
+        q_expanded, 
+        k_selected.transpose(-1, -2)
+    ) * softmax_scale
+    
+    # 计算注意力权重并加权求和
+    attn_weights = torch.softmax(attn_scores, dim=-1)
+    o = torch.einsum('lnhk,lkhd->lnhd', attn_weights, v_selected)
+    
+    # 重组输出张量 [total_len, num_q_heads, head_dim]
+    return o.view(total_seqlen, num_q_heads, head_dim)
