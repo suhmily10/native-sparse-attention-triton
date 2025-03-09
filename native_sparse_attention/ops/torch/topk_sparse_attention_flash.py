@@ -211,15 +211,15 @@ def topk_sparse_attention_flash(
     # 只计算MoBA部分，无自注意力
     logger.info("Calling flash_attn_varlen_func")
     try:
-        # 根据开关决定是否使用profiler
+        # 优化2：移除冗余的to()操作
         if profile_profiling:
             with torch.profiler.profile(
-                activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU]
+                activities=[torch.profiler.ProfilerActivity.CUDA]
             ) as prof:
                 moba_attn_out = flash_attn_varlen_func(
-                    q=moba_q.to(torch.bfloat16),
-                    k=moba_kv[:, 0].to(torch.bfloat16),
-                    v=moba_kv[:, 1].to(torch.bfloat16),
+                    q=moba_q,  # 已提前转换类型
+                    k=moba_kv[:, 0],
+                    v=moba_kv[:, 1],
                     cu_seqlens_q=moba_cu_seqlen_q,
                     cu_seqlens_k=moba_cu_seqlen_kv,
                     max_seqlen_q=total_len,
@@ -228,17 +228,19 @@ def topk_sparse_attention_flash(
                     dropout_p=0.0,
                 )
         else:
-            moba_attn_out = flash_attn_varlen_func(
-                q=moba_q.to(torch.bfloat16),
-                k=moba_kv[:, 0].to(torch.bfloat16),
-                v=moba_kv[:, 1].to(torch.bfloat16),
-                cu_seqlens_q=moba_cu_seqlen_q,
-                cu_seqlens_k=moba_cu_seqlen_kv,
-                max_seqlen_q=total_len,
-                max_seqlen_k=block_size,
-                causal=False,
-                dropout_p=0.0,
-            )
+            # 优化3：使用PyTorch自动混合精度
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                moba_attn_out = flash_attn_varlen_func(
+                    q=moba_q,
+                    k=moba_kv[:, 0],
+                    v=moba_kv[:, 1],
+                    cu_seqlens_q=moba_cu_seqlen_q,
+                    cu_seqlens_k=moba_cu_seqlen_kv,
+                    max_seqlen_q=total_len,
+                    max_seqlen_k=block_size,
+                    causal=False,
+                    dropout_p=0.0,
+                )
         logger.info(f"flash_attn_varlen_func completed, moba_attn_out shape={moba_attn_out.shape}")
     except Exception as e:
         logger.error(f"Error in flash_attn_varlen_func: {str(e)}")
@@ -246,12 +248,14 @@ def topk_sparse_attention_flash(
         logger.error(f"cu_seqlens_q={moba_cu_seqlen_q}, cu_seqlens_k={moba_cu_seqlen_kv}")
         raise
     
-    # 修改结果分配逻辑（直接覆盖代替累加）
-    logger.info("Distributing attention results to output tensor")
-    output_2d = output.view(-1, q.shape[2])
-    raw_attn_out = moba_attn_out.view(-1, moba_attn_out.shape[-1])
-    raw_attn_out = raw_attn_out.to(output_2d.dtype)
-    output_2d[moba_q_sh_indices] = raw_attn_out  # 直接赋值代替index_add
+    # 优化4：优化结果分配逻辑
+    logger.info("Optimized result distribution")
+    output_2d = output.view(-1, head_dim)
+    output_2d.index_add_(
+        0, 
+        moba_q_sh_indices, 
+        moba_attn_out.reshape(-1, head_dim).to(output_2d.dtype)
+    )
     output = output.to(q.dtype)
     
     logger.info(f"Completed topk_sparse_attention_flash in {time.time() - start_time:.2f}s, output shape={output.shape}")
