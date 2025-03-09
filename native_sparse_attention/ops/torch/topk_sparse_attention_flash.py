@@ -26,7 +26,7 @@ from functools import lru_cache
 
 # Set up logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%H:%M:%S'
 )
@@ -96,6 +96,7 @@ def topk_sparse_attention_flash(
     block_size: int,
     cu_seqlens: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    profile_profiling: bool = False,  # 新增性能分析开关
 ) -> torch.Tensor:
     """使用预计算的topk索引实现的稀疏注意力计算
     
@@ -107,6 +108,7 @@ def topk_sparse_attention_flash(
         block_size (int): key-value块大小
         cu_seqlens (torch.Tensor): 形状 [batch_size + 1]，与flash_attn中的cu_seqlens相似
         softmax_scale (Optional[float]): 默认为None，表示1/sqrt(head_dim)
+        profile_profiling (bool): 是否进行性能分析，默认为False
         
     Returns:
         torch.Tensor: 注意力输出，形状 [total_len, num_q_heads, head_dim]
@@ -149,7 +151,7 @@ def topk_sparse_attention_flash(
     logger.info(f"filtered_kv_indices shape={filtered_kv_indices.shape}")
     
     logger.info("Selecting filtered KV tensors")
-    filtered_kv = kv.index_select(0, filtered_kv_indices.view(-1))  # [num_filtered_chunk * block_size, 2, num_kv_heads, head_dim]
+    filtered_kv = kv[filtered_kv_indices.view(-1)]  # 直接索引比 index_select 更快
     logger.info(f"filtered_kv shape={filtered_kv.shape}")
     
     # 移除gate_mask相关逻辑
@@ -164,7 +166,7 @@ def topk_sparse_attention_flash(
 
     # 直接使用原始q矩阵
     logger.info("Selecting all query vectors")
-    moba_q = rearrange(q, "s h d -> (h s) d").index_select(0, moba_q_indices)  # [total_queries, head_dim]
+    moba_q = rearrange(q, "s h d -> (h s) d")[moba_q_indices]  # 直接索引
     moba_q = moba_q.unsqueeze(1)  # [total_queries, 1, head_dim]
     
     # 记录原始位置（直接顺序映射）
@@ -173,8 +175,7 @@ def topk_sparse_attention_flash(
     # 重组KV矩阵以适应查询排列
     logger.info("Reorganizing KV tensors")
     moba_kv = rearrange(filtered_kv, "s x h d -> h s x d")
-    moba_kv = moba_kv.split(block_size, dim=1)
-    moba_kv = torch.cat(moba_kv, dim=0)  # [num_filtered_chunk * num_kv_heads, block_size, 2, head_dim]
+    moba_kv = moba_kv.reshape(-1, block_size, 2, moba_kv.shape[-1])
     logger.info(f"rearranged moba_kv shape={moba_kv.shape}")
     
     # 处理不同数量的q和kv heads
@@ -210,17 +211,34 @@ def topk_sparse_attention_flash(
     # 只计算MoBA部分，无自注意力
     logger.info("Calling flash_attn_varlen_func")
     try:
-        moba_attn_out = flash_attn_varlen_func(
-            q=moba_q.to(torch.bfloat16),
-            k=moba_kv[:, 0].to(torch.bfloat16),
-            v=moba_kv[:, 1].to(torch.bfloat16),
-            cu_seqlens_q=moba_cu_seqlen_q,
-            cu_seqlens_k=moba_cu_seqlen_kv,
-            max_seqlen_q=total_len,
-            max_seqlen_k=block_size,
-            causal=False,
-            dropout_p=0.0,
-        )
+        # 根据开关决定是否使用profiler
+        if profile_profiling:
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU]
+            ) as prof:
+                moba_attn_out = flash_attn_varlen_func(
+                    q=moba_q.to(torch.bfloat16),
+                    k=moba_kv[:, 0].to(torch.bfloat16),
+                    v=moba_kv[:, 1].to(torch.bfloat16),
+                    cu_seqlens_q=moba_cu_seqlen_q,
+                    cu_seqlens_k=moba_cu_seqlen_kv,
+                    max_seqlen_q=total_len,
+                    max_seqlen_k=block_size,
+                    causal=False,
+                    dropout_p=0.0,
+                )
+        else:
+            moba_attn_out = flash_attn_varlen_func(
+                q=moba_q.to(torch.bfloat16),
+                k=moba_kv[:, 0].to(torch.bfloat16),
+                v=moba_kv[:, 1].to(torch.bfloat16),
+                cu_seqlens_q=moba_cu_seqlen_q,
+                cu_seqlens_k=moba_cu_seqlen_kv,
+                max_seqlen_q=total_len,
+                max_seqlen_k=block_size,
+                causal=False,
+                dropout_p=0.0,
+            )
         logger.info(f"flash_attn_varlen_func completed, moba_attn_out shape={moba_attn_out.shape}")
     except Exception as e:
         logger.error(f"Error in flash_attn_varlen_func: {str(e)}")
@@ -237,4 +255,6 @@ def topk_sparse_attention_flash(
     output = output.to(q.dtype)
     
     logger.info(f"Completed topk_sparse_attention_flash in {time.time() - start_time:.2f}s, output shape={output.shape}")
+    if profile_profiling:  # 只在开启时输出性能分析结果
+        logger.info(f"Profiling results:\n{prof.key_averages().table(sort_by='cuda_time_total')}")
     return output
