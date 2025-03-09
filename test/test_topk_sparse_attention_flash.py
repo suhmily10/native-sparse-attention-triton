@@ -114,7 +114,7 @@ if __name__ == "__main__":
     q = (
         torch.empty(cu_seqlens[-1], 8, 96, device="cuda")
         .uniform_(-1, 1)
-        .to(torch.float)
+        .to(torch.bfloat16)
     )
     k = (
         torch.empty(cu_seqlens[-1], 4, 96, device="cuda")
@@ -131,14 +131,6 @@ if __name__ == "__main__":
     v.requires_grad = True
     topk_idx = generate_topk_idx_example(seqlens, block_size, topk, 4)
 
-    logger.info("Running reference implementation: topk_sparse_attention_torch")
-    o = topk_sparse_attention_torch(q, k, v, topk_idx, block_size, cu_seqlens)
-
-    randn = torch.randn_like(o)
-    loss = (o * randn).sum()
-    loss.backward()
-    logger.info("Completed reference implementation backward pass")
-
     logger.info("Running test implementation: topk_sparse_attention_flash")
     torch.manual_seed(42)
     q1 = q.clone().detach().requires_grad_()
@@ -149,23 +141,36 @@ if __name__ == "__main__":
 
     o1 = topk_sparse_attention_flash(q1, k1, v1, topk_idx1, block_size, cu_seqlens1)
 
-    randn2 = randn.clone().detach()
-    loss2 = (o1 * randn2).sum()
-    loss2.backward()
+    randn = torch.randn_like(o1)
+    loss1 = (o1 * randn).sum()
+    loss1.backward()
     logger.info("Completed test implementation backward pass")
 
+    logger.info("Running reference implementation: topk_sparse_attention_torch")
+    q2 = q.clone().detach().requires_grad_()
+    k2 = k.clone().detach().requires_grad_()
+    v2 = v.clone().detach().requires_grad_()
+    topk_idx2 = topk_idx.clone().detach()
+    
+    o2 = topk_sparse_attention_torch(q2, k2, v2, topk_idx2, block_size, cu_seqlens)
+    
+    randn2 = randn.clone().detach()
+    loss2 = (o2 * randn2).sum()
+    loss2.backward()
+    logger.info("Completed reference implementation backward pass")
+
     logger.info("Comparing results between implementations")
-    print("Same Output:", torch.allclose(o, o1, atol=0.01, rtol=0.01))
-    print("Max Error:", (o - o1).abs().max().item())
+    print("Same Output:", torch.allclose(o1, o2, atol=0.01, rtol=0.01))
+    print("Max Error:", (o1 - o2).abs().max().item())
     print()
-    print("Same Query Gradient:", torch.allclose(q.grad, q1.grad, atol=0.01, rtol=0.01))
-    print("Max Query Gradient Error:", (q.grad - q1.grad).abs().max().item())
+    print("Same Query Gradient:", torch.allclose(q1.grad, q2.grad, atol=0.01, rtol=0.01))
+    print("Max Query Gradient Error:", (q1.grad - q2.grad).abs().max().item())
     print()
-    print("Same Key Gradient:", torch.allclose(k.grad, k1.grad, atol=0.01, rtol=0.01))
-    print("Max Key Gradient Error:", (k.grad - k1.grad).abs().max().item())
+    print("Same Key Gradient:", torch.allclose(k1.grad, k2.grad, atol=0.01, rtol=0.01))
+    print("Max Key Gradient Error:", (k1.grad - k2.grad).abs().max().item())
     print()
-    print("Same Value Gradient:", torch.allclose(v.grad, v1.grad, atol=0.01, rtol=0.01))
-    print("Max Value Gradient Error:", (v.grad - v1.grad).abs().max().item())
+    print("Same Value Gradient:", torch.allclose(v1.grad, v2.grad, atol=0.01, rtol=0.01))
+    print("Max Value Gradient Error:", (v1.grad - v2.grad).abs().max().item())
     print()
     logger.info("Comparison completed")
 
