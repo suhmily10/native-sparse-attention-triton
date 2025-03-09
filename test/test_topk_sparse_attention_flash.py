@@ -79,7 +79,9 @@ def generate_topk_idx_example(
 if __name__ == "__main__":
     torch.manual_seed(42)
     batch_size = 3
-    seqlens = torch.LongTensor([1000, 2000, 4096]).int().cuda()
+    block_size = 64
+    # Ensure all sequence lengths are multiples of block_size
+    seqlens = torch.LongTensor([960, 1984, 4096]).int().cuda()  # All divisible by 64
     cu_seqlens = torch.cat(
         [
             torch.zeros(1, dtype=torch.int32, device="cuda"),
@@ -106,7 +108,6 @@ if __name__ == "__main__":
     q.requires_grad = True
     k.requires_grad = True
     v.requires_grad = True
-    block_size = 64
     topk = 5
     topk_idx = generate_topk_idx_example(seqlens, block_size, topk, 4)
 
