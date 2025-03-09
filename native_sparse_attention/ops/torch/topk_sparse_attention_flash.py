@@ -129,157 +129,94 @@ def topk_sparse_attention_flash(
     Returns:
         torch.Tensor: 注意力输出，形状 [total_len, num_q_heads, head_dim]
     """
-    start_time = time.time()
-    if logger.isEnabledFor(logging.DEBUG):  # 先检查日志级别再执行格式化
+    if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"Starting topk_sparse_attention_flash with shapes: q={q.shape}, k={k.shape}, v={v.shape}, topk_idx={topk_idx.shape}")
         logger.debug(f"block_size={block_size}, cu_seqlens={cu_seqlens}")
     
-    # 基本设置
-    logger.debug("Stacking k and v")
-    kv = torch.stack((k, v), dim=1)  # [total_len, 2, num_kv_heads, head_dim]
+    # 合并变量定义和基本设置
     total_len, num_q_head, head_dim = q.shape
-    # Get the number of KV heads from the shape of k/v/topk_idx
     num_kv_head = topk_idx.shape[0]
-    logger.debug(f"total_len={total_len}, num_q_head={num_q_head}, num_kv_head={num_kv_head}, head_dim={head_dim}")
+    softmax_scale = softmax_scale or head_dim ** (-0.5)
     
-    # 如果没有指定softmax_scale，使用默认值
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-    logger.debug(f"softmax_scale={softmax_scale}")
-    
-    # 直接从topk_idx中提取唯一的块索引
-    logger.debug("Extracting unique block indices from topk_idx")
-    # Reshape to flatten all dimensions and remove padding (-1 values)
-    flat_topk = topk_idx.reshape(-1)
-    valid_indices = flat_topk >= 0
-    unique_chunks = flat_topk[valid_indices].unique()
+    # 直接从topk_idx提取唯一块索引 (减少中间变量)
+    unique_chunks = topk_idx.reshape(-1)[topk_idx.reshape(-1) >= 0].unique()
     num_chunk = len(unique_chunks)
     
-    logger.debug(f"Found {num_chunk} unique chunk indices")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"Found {num_chunk} unique chunk indices")
     
-    # 创建块到偏移量的映射
-    logger.debug("Creating block offset mapping")
-    block_offsets = unique_chunks * block_size
+    # 创建KV索引并选择相关KV (合并操作减少中间变量)
+    filtered_kv = torch.stack((k, v), dim=1).index_select(
+        0, 
+        (unique_chunks[:, None] * block_size + torch.arange(0, block_size, device=q.device)).flatten()
+    )
     
-    # 创建KV索引
-    logger.debug("Creating filtered KV indices")
-    filtered_kv_indices = (block_offsets[:, None] + 
-                          torch.arange(0, block_size, device=q.device)).flatten()
+    # 创建cu_seqlen和准备查询矩阵 (减少中间变量)
+    moba_cu_seqlen = torch.arange(0, (num_chunk * num_q_head + 1) * block_size, block_size, 
+                                 device=q.device, dtype=torch.int32)
     
-    # 优化3：使用index_select代替直接索引
-    logger.debug("Selecting filtered KV tensors")
-    filtered_kv = kv.index_select(0, filtered_kv_indices)
+    # 准备查询和KV矩阵 (合并操作)
+    moba_q = q.transpose(0, 1).reshape(-1, head_dim).unsqueeze(1)  # [num_q_head*total_len, 1, head_dim]
     
-    # 每个chunk的查询数量固定为block_size
-    moba_cu_seqlen_q = torch.arange(0, (num_chunk * num_q_head + 1) * block_size, block_size, device=q.device, dtype=torch.int32)
-
-    # 直接使用展平的查询矩阵，不需要额外的索引
-    logger.debug("Preparing query vectors with simplified indexing")
-    moba_q = rearrange(q, "s h d -> (h s) d")
-    moba_q = moba_q.unsqueeze(1)  # [total_queries, 1, head_dim]
-    
-    # 重组KV矩阵以适应查询排列
-    logger.debug("Reorganizing KV tensors")
-    moba_kv = rearrange(filtered_kv, "s x h d -> h s x d")
-    moba_kv = moba_kv.reshape(-1, block_size, 2, moba_kv.shape[-1])
-    logger.debug(f"rearranged moba_kv shape={moba_kv.shape}")
+    # 重组KV矩阵 (简化转换步骤)
+    moba_kv = filtered_kv.reshape(-1, 2, num_kv_head, head_dim)
+    moba_kv = moba_kv.transpose(1, 2).reshape(-1, block_size, 2, head_dim)
     
     # 处理不同数量的q和kv heads
     if num_q_head > num_kv_head:
-        # 计算每个kv head对应的q head数量
-        q_heads_per_kv_head = num_q_head // num_kv_head
-        logger.debug(f"Repeating KV {q_heads_per_kv_head} times for each KV head")
-        # 复制kv，使其匹配q heads的数量
-        moba_kv = torch.repeat_interleave(moba_kv, q_heads_per_kv_head, dim=0)
-        logger.debug(f"repeated moba_kv shape={moba_kv.shape}")
+        moba_kv = torch.repeat_interleave(moba_kv, num_q_head // num_kv_head, dim=0)
     
+    # 准备最终KV格式
     moba_kv = moba_kv.flatten(start_dim=0, end_dim=1).unsqueeze(2)  # [num_chunks*block_size, 2, 1, head_dim]
-    logger.debug(f"final moba_kv shape={moba_kv.shape}")
     
-    # 构建cu_seqlen_kv用于flash attention
-    logger.debug("Building cu_seqlen_kv")
-    moba_cu_seqlen_kv = torch.arange(
-        0, num_chunk * num_q_head + 1,
-        dtype=torch.int32, device=q.device
-    ) * block_size
-    logger.debug(f"moba_cu_seqlen_kv shape={moba_cu_seqlen_kv.shape}")
-    
-    # 检查形状一致性
-    logger.debug(f"Verifying moba_cu_seqlen_q shape={moba_cu_seqlen_q.shape} matches moba_cu_seqlen_kv shape={moba_cu_seqlen_kv.shape}")
-    assert moba_cu_seqlen_kv.shape == moba_cu_seqlen_q.shape
-    
-    # 使用自定义MixedAttention实现注意力计算
-    logger.debug("Creating output tensor")
-    output = torch.zeros(
-        (q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32
-    )
-    
-    # 只计算MoBA部分，无自注意力
-    logger.debug("Calling flash_attn_varlen_func")
+    # 使用flash attention计算输出
     try:
-        # 修改性能分析部分，减少同步开销
         if profile_profiling:
-            # 使用更轻量级的性能分析方式
             with torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CUDA],
-                with_stack=False,  # 关闭堆栈跟踪以减少开销
-                record_shapes=False,  # 除非必要，否则不记录形状
-                profile_memory=True,  # 启用内存分析
+                with_stack=False,
+                record_shapes=False,
+                profile_memory=True,
                 with_flops=True,
                 use_cuda=True
             ) as prof:
-                torch.cuda.synchronize()  # 确保GPU操作开始前同步
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
+                torch.cuda.synchronize()
+                start_event, end_event = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                 
                 start_event.record()
-                moba_attn_out = flash_attn_varlen_func(
+                out = flash_attn_varlen_func(
                     q=moba_q,
                     k=moba_kv[:, 0],
                     v=moba_kv[:, 1],
-                    cu_seqlens_q=moba_cu_seqlen_q,
-                    cu_seqlens_k=moba_cu_seqlen_kv,
+                    cu_seqlens_q=moba_cu_seqlen,
+                    cu_seqlens_k=moba_cu_seqlen,
                     max_seqlen_q=total_len,
                     max_seqlen_k=block_size,
                     causal=False,
                     dropout_p=0.0,
                 )
                 end_event.record()
-                torch.cuda.synchronize()  # 确保GPU操作完成
-                gpu_time_ms = start_event.elapsed_time(end_event)
-                
-            # 输出更详细的GPU分析结果
-            logger.info(f"GPU Time: {gpu_time_ms:.2f} ms")
-            logger.info(f"Profiling results:\n{prof.key_averages().table(sort_by='cuda_time_total', row_limit=10)}")
-            logger.info(f"GPU Memory Stats: {torch.cuda.memory_summary(abbreviated=True)}")
+                torch.cuda.synchronize()
+                logger.info(f"GPU Time: {start_event.elapsed_time(end_event):.2f} ms")
+                logger.info(f"Profiling summary:\n{prof.key_averages().table(sort_by='cuda_time_total', row_limit=10)}")
         else:
             # 使用异步执行和混合精度
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
-                moba_attn_out = flash_attn_varlen_func(
+                out = flash_attn_varlen_func(
                     q=moba_q,
                     k=moba_kv[:, 0],
                     v=moba_kv[:, 1],
-                    cu_seqlens_q=moba_cu_seqlen_q,
-                    cu_seqlens_k=moba_cu_seqlen_kv,
+                    cu_seqlens_q=moba_cu_seqlen,
+                    cu_seqlens_k=moba_cu_seqlen,
                     max_seqlen_q=total_len,
                     max_seqlen_k=block_size,
                     causal=False,
                     dropout_p=0.0,
                 )
-        logger.debug(f"flash_attn_varlen_func completed, moba_attn_out shape={moba_attn_out.shape}")
     except Exception as e:
         logger.error(f"Error in flash_attn_varlen_func: {str(e)}")
-        logger.error(f"q shape={moba_q.shape}, k shape={moba_kv[:, 0].shape}, v shape={moba_kv[:, 1].shape}")
-        logger.error(f"cu_seqlens_q={moba_cu_seqlen_q}, cu_seqlens_k={moba_cu_seqlen_kv}")
+        logger.error(f"Shapes: q={moba_q.shape}, k={moba_kv[:, 0].shape}, v={moba_kv[:, 1].shape}")
         raise
     
-    # 优化4: 不需要使用索引操作，直接重塑结果
-    output = moba_attn_out.reshape(num_q_head, total_len, head_dim).transpose(0, 1)
-
-    # 优化5: 避免不必要的dtype转换
-    output = output.to(q.dtype)
-    
-    logger.debug(f"Completed topk_sparse_attention_flash in {time.time() - start_time:.2f}s, output shape={output.shape}")
-    if profile_profiling:  # 只在开启时输出性能分析结果
-        logger.info(f"Profiling results:\n{prof.key_averages().table(sort_by='cuda_time_total')}")
-    return output
+    # 直接重塑输出并返回 (简化类型转换)
+    return out.reshape(num_q_head, total_len, head_dim).transpose(0, 1).to(q.dtype)
