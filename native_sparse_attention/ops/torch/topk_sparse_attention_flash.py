@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=16)
 def calc_chunks(cu_seqlen, moba_chunk_size):
-    """calc chunks that needs moba attention"""
+    """calc chunks for moba attention (keeping all chunks including last ones)"""
     logger.debug(f"calc_chunks: cu_seqlen shape={cu_seqlen.shape}, moba_chunk_size={moba_chunk_size}")
 
     # batch_sizes[batch_idx] = batch size ( seqlen ) of batch idx
@@ -66,24 +66,15 @@ def calc_chunks(cu_seqlen, moba_chunk_size):
     chunk_to_batch[cu_num_chunk[1:-1]] = 1
     chunk_to_batch = chunk_to_batch.cumsum(dim=0, dtype=torch.int32)
 
-    """ filter chunks that need moba attn """
+    # Use all chunks instead of filtering out the last chunk of each batch
+    all_chunk_indices = torch.arange(num_chunk, device=cu_seqlen.device)
 
-    # filter chunks ( remove last chunk of each batch )
-    # filtered_chunk_indices: chunk index list that excludes the last chunk of each batch
-    chunk_to_remove = cu_num_chunk[1:] - 1
-    chunk_to_remain = torch.ones(
-        (num_chunk,), dtype=torch.bool, device=cu_seqlen.device
-    )
-    chunk_to_remain[chunk_to_remove] = False
-    filtered_chunk_indices = chunk_to_remain.nonzero(as_tuple=True)[0]
-    num_filtered_chunk = len(filtered_chunk_indices)
-
-    logger.debug(f"calc_chunks: returning {num_filtered_chunk} filtered chunks")
+    logger.debug(f"calc_chunks: returning {num_chunk} chunks (keeping all chunks)")
     return (
         cu_chunk,
-        filtered_chunk_indices,
-        num_filtered_chunk,
-        filtered_chunk_indices,
+        all_chunk_indices,
+        num_chunk,
+        all_chunk_indices,
         chunk_to_batch,
     )
 
@@ -135,13 +126,13 @@ def topk_sparse_attention_flash(
     logger.debug("Calculating chunks")
     (
         cu_chunk,
-        filtered_chunk_indices,
-        num_filtered_chunk,
+        all_chunk_indices,
+        num_chunk,
         _,
         chunk_to_batch,
     ) = calc_chunks(cu_seqlens, block_size)
-    logger.debug(f"cu_chunk shape={cu_chunk.shape}, filtered_chunk_indices shape={filtered_chunk_indices.shape}")
-    logger.debug(f"num_filtered_chunk={num_filtered_chunk}")
+    logger.debug(f"cu_chunk shape={cu_chunk.shape}, all_chunk_indices shape={all_chunk_indices.shape}")
+    logger.debug(f"num_chunk={num_chunk}")
     
     # 优化1：减少日志开销
     # 将调试日志改为TRACE级别，并添加条件判断
@@ -150,7 +141,7 @@ def topk_sparse_attention_flash(
 
     # 优化2：使用更高效的内存分配方式
     logger.debug("Creating filtered KV indices")
-    filtered_kv_indices = (cu_chunk[filtered_chunk_indices][:, None] + 
+    filtered_kv_indices = (cu_chunk[all_chunk_indices][:, None] + 
                           torch.arange(0, block_size, device=q.device)).flatten()
     
     # 优化3：使用index_select代替直接索引
@@ -165,8 +156,8 @@ def topk_sparse_attention_flash(
     # 可以直接使用 rearrange 的展平功能，无需创建复杂的索引张量
     
     # 每个chunk的查询数量固定为block_size
-    moba_seqlen_q = torch.full((num_filtered_chunk * num_q_head,), block_size, device=q.device)
-    moba_cu_seqlen_q = torch.arange(0, (num_filtered_chunk * num_q_head + 1) * block_size, block_size, device=q.device, dtype=torch.int32)
+    moba_seqlen_q = torch.full((num_chunk * num_q_head,), block_size, device=q.device)
+    moba_cu_seqlen_q = torch.arange(0, (num_chunk * num_q_head + 1) * block_size, block_size, device=q.device, dtype=torch.int32)
 
     # 直接使用展平的查询矩阵，不需要额外的索引
     logger.debug("Preparing query vectors with simplified indexing")
@@ -194,7 +185,7 @@ def topk_sparse_attention_flash(
     # 构建cu_seqlen_kv用于flash attention
     logger.debug("Building cu_seqlen_kv")
     moba_cu_seqlen_kv = torch.arange(
-        0, num_filtered_chunk * num_q_head + 1,
+        0, num_chunk * num_q_head + 1,
         dtype=torch.int32, device=q.device
     ) * block_size
     logger.debug(f"moba_cu_seqlen_kv shape={moba_cu_seqlen_kv.shape}")

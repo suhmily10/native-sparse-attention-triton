@@ -86,13 +86,13 @@ def generate_topk_idx_example(
 
 
 if __name__ == "__main__":
-    logger.info("Starting test script execution")
+    logger.debug("Starting test script execution")
     torch.manual_seed(42)
     batch_size = 3
     block_size = 64
     topk = 16
     
-    logger.info("Preparing test data and parameters")
+    logger.debug("Preparing test data and parameters")
     # Ensure all sequence lengths are at least blocksize*topk
     min_seqlen = block_size * topk
     # Ensure all sequence lengths are multiples of block_size and greater than min_seqlen
@@ -131,7 +131,7 @@ if __name__ == "__main__":
     v.requires_grad = True
     topk_idx = generate_topk_idx_example(seqlens, block_size, topk, 4)
 
-    logger.info("Running test implementation: topk_sparse_attention_flash")
+    logger.debug("Running test implementation: topk_sparse_attention_flash")
     torch.manual_seed(42)
     q1 = q.clone().detach().requires_grad_()
     k1 = k.clone().detach().requires_grad_()
@@ -144,9 +144,9 @@ if __name__ == "__main__":
     randn = torch.randn_like(o1)
     loss1 = (o1 * randn).sum()
     loss1.backward()
-    logger.info("Completed test implementation backward pass")
+    logger.debug("Completed test implementation backward pass")
 
-    logger.info("Running reference implementation: topk_sparse_attention_torch")
+    logger.debug("Running reference implementation: topk_sparse_attention_torch")
     q2 = q.clone().detach().requires_grad_()
     k2 = k.clone().detach().requires_grad_()
     v2 = v.clone().detach().requires_grad_()
@@ -157,9 +157,9 @@ if __name__ == "__main__":
     randn2 = randn.clone().detach()
     loss2 = (o2 * randn2).sum()
     loss2.backward()
-    logger.info("Completed reference implementation backward pass")
+    logger.debug("Completed reference implementation backward pass")
 
-    logger.info("Comparing results between implementations")
+    logger.debug("Comparing results between implementations")
     print("Same Output:", torch.allclose(o1, o2, atol=0.01, rtol=0.01))
     print("Max Error:", (o1 - o2).abs().max().item())
     print()
@@ -172,10 +172,10 @@ if __name__ == "__main__":
     print("Same Value Gradient:", torch.allclose(v1.grad, v2.grad, atol=0.01, rtol=0.01))
     print("Max Value Gradient Error:", (v1.grad - v2.grad).abs().max().item())
     print()
-    logger.info("Comparison completed")
+    logger.debug("Comparison completed")
 
     # benchmark forward pass
-    logger.info("Setting up forward pass benchmark")
+    logger.debug("Setting up forward pass benchmark")
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["N"],
@@ -196,7 +196,7 @@ if __name__ == "__main__":
         )
     )
     def benchmark_forward(N, H, D, provider):
-        logger.info(f"Forward benchmark: N={N}, H={H}, D={D}, provider={provider}")
+        logger.debug(f"Forward benchmark: N={N}, H={H}, D={D}, provider={provider}")
         q = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
         k = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
         v = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
@@ -209,7 +209,7 @@ if __name__ == "__main__":
 
         quantiles = [0.5, 0.2, 0.8]
         if provider == "flash":
-            logger.info(f"Running flash-attention forward benchmark with N={N}")
+            logger.debug(f"Running flash-attention forward benchmark with N={N}")
             start_time = time.time()
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: _flash_attn_varlen_forward(
@@ -226,9 +226,9 @@ if __name__ == "__main__":
                 ),
                 quantiles=quantiles,
             )
-            logger.info(f"Completed flash-attention forward benchmark in {time.time() - start_time:.2f}s")
+            logger.debug(f"Completed flash-attention forward benchmark in {time.time() - start_time:.2f}s")
         if provider == "topk-flash":
-            logger.info(f"Running topk-flash-attention forward benchmark with N={N}")
+            logger.debug(f"Running topk-flash-attention forward benchmark with N={N}")
             start_time = time.time()
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: topk_sparse_attention_flash(
@@ -236,15 +236,15 @@ if __name__ == "__main__":
                 ),
                 quantiles=quantiles,
             )
-            logger.info(f"Completed topk-flash-attention forward benchmark in {time.time() - start_time:.2f}s")
+            logger.debug(f"Completed topk-flash-attention forward benchmark in {time.time() - start_time:.2f}s")
         return ms, min_ms, max_ms
 
-    logger.info("Starting forward benchmark runs")
+    logger.debug("Starting forward benchmark runs")
     benchmark_forward.run(show_plots=True, print_data=True)
-    logger.info("Completed forward benchmark runs")
+    logger.debug("Completed forward benchmark runs")
 
     # benchmark backward pass
-    logger.info("Setting up backward pass benchmark")
+    logger.debug("Setting up backward pass benchmark")
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["N"],
@@ -262,7 +262,7 @@ if __name__ == "__main__":
         )
     )
     def benchmark_backward(N, H, D, provider):
-        logger.info(f"Backward benchmark: N={N}, H={H}, D={D}, provider={provider}")
+        logger.debug(f"Backward benchmark: N={N}, H={H}, D={D}, provider={provider}")
         q = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
         k = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
         v = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
@@ -281,7 +281,7 @@ if __name__ == "__main__":
 
         quantiles = [0.5, 0.2, 0.8]
         if provider == "flash":
-            logger.info(f"Running flash-attention backward benchmark with N={N}")
+            logger.debug(f"Running flash-attention backward benchmark with N={N}")
             start_time = time.time()
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: _flash_attn_varlen_backward(
@@ -309,9 +309,9 @@ if __name__ == "__main__":
                 ),
                 quantiles=quantiles,
             )
-            logger.info(f"Completed flash-attention backward benchmark in {time.time() - start_time:.2f}s")
+            logger.debug(f"Completed flash-attention backward benchmark in {time.time() - start_time:.2f}s")
         elif provider == "topk-flash":
-            logger.info(f"Running topk-flash-attention backward benchmark with N={N}")
+            logger.debug(f"Running topk-flash-attention backward benchmark with N={N}")
             start_time = time.time()
             
             # For backward benchmarking, we need to run forward first with grad enabled
@@ -331,11 +331,11 @@ if __name__ == "__main__":
                 run_forward_backward,
                 quantiles=quantiles,
             )
-            logger.info(f"Completed topk-flash-attention backward benchmark in {time.time() - start_time:.2f}s")
+            logger.debug(f"Completed topk-flash-attention backward benchmark in {time.time() - start_time:.2f}s")
         return ms, min_ms, max_ms
 
-    logger.info("Starting backward benchmark runs")
+    logger.debug("Starting backward benchmark runs")
     benchmark_backward.run(show_plots=True, print_data=True)
-    logger.info("Completed backward benchmark runs and script execution")
+    logger.debug("Completed backward benchmark runs and script execution")
 
  
