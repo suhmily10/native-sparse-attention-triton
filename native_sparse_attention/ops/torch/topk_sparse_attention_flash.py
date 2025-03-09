@@ -161,28 +161,28 @@ def topk_sparse_attention_flash(
     )
     logger.info(f"gate_mask shape={gate_mask.shape}")
     
-    # 对每个head、每个位置，将对应的topk块在gate_mask中标记为True
+    # 对每个位置，将对应的topk块在gate_mask中标记为True
     logger.info("Updating gate mask based on topk blocks")
-    for h_q in range(num_q_head):
-        # Map query head to corresponding kv head
-        h_kv = h_q % num_kv_head  # This handles the case where num_q_head > num_kv_head
-        if h_q % 20 == 0:  # Log periodically to avoid excessive output
-            logger.info(f"Processing query head {h_q}/{num_q_head}")
-        for s in range(total_len):
-            # 获取当前位置的topk块
-            blocks = topk_idx[h_kv, s]  # [topk]
-            valid_blocks = blocks[blocks >= 0]  # 排除填充值-1
-            
-            # 在gate_mask中标记这些块
-            if len(valid_blocks) > 0:
-                # 将块索引转换为filtered_chunk_indices中的索引
-                mask_indices = torch.zeros_like(valid_blocks, dtype=torch.bool)
-                for i, block_idx in enumerate(valid_blocks):
-                    # 检查block_idx是否在filtered_chunk_indices中
-                    is_in_filtered = (filtered_chunk_indices == block_idx)
-                    if is_in_filtered.any():
-                        filtered_idx = torch.where(is_in_filtered)[0][0]
-                        gate_mask[filtered_idx, h_q, s] = True
+    # Vectorized implementation with bounds checking
+    h_kv = 0  # Use first KV head for indices
+    valid_mask = topk_idx[h_kv] != -1  # [total_len, topk]
+    valid_s, valid_k = torch.where(valid_mask)
+    valid_block_indices = topk_idx[h_kv, valid_s, valid_k]  # [num_valid]
+    
+    # Create sorted version of filtered chunks for search
+    sorted_filtered, _ = torch.sort(filtered_chunk_indices)
+    # Find positions where valid blocks exist in filtered chunks
+    pos = torch.searchsorted(sorted_filtered, valid_block_indices)
+    # Create mask for valid positions
+    valid_pos_mask = (pos < len(sorted_filtered)) & (sorted_filtered[pos] == valid_block_indices)
+    
+    # Get final valid indices
+    filtered_idx = pos[valid_pos_mask]
+    valid_s_filtered = valid_s[valid_pos_mask]
+    
+    # Update gate mask safely
+    if filtered_idx.numel() > 0:
+        gate_mask[filtered_idx, :, valid_s_filtered] = True
     
     logger.info("Finding queries that need attention")
     # 组合所有需要注意力的查询索引
