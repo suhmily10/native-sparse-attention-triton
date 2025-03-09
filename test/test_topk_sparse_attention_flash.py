@@ -102,8 +102,8 @@ if __name__ == "__main__":
     logger.debug("Starting test script execution")
     torch.manual_seed(42)
     batch_size = 3
-    block_size = 64
-    topk = 16
+    block_size = 256
+    topk = 4
     
     logger.debug("Preparing test data and parameters")
     # Ensure all sequence lengths are at least blocksize*topk
@@ -204,7 +204,7 @@ if __name__ == "__main__":
             ],
             styles=[("green", "-"), ("blue", "-")],
             ylabel="ms",
-            plot_name="** forward with block size 64 **",
+            plot_name="** forward with block size 256 **",
             args={"H": 8, "D": 96},
         )
     )
@@ -217,8 +217,8 @@ if __name__ == "__main__":
         sm_scale = 1 / math.sqrt(D)
 
         # Generate topk indices for sparse attention
-        topk = 16
-        top_idx = generate_topk_idx_example(cu_seqlens[1:], 64, topk, H // 2)
+        topk = 4
+        top_idx = generate_topk_idx_example(cu_seqlens[1:], 256, topk, H // 2)
 
         try:
             if provider == "flash":
@@ -246,7 +246,7 @@ if __name__ == "__main__":
                 start_time = time.time()
                 ms = bench(
                     lambda: topk_sparse_attention_flash(
-                        q, k, v, top_idx, 64, cu_seqlens, sm_scale
+                        q, k, v, top_idx, 256, cu_seqlens, sm_scale
                     )
                 )
                 min_ms = ms
@@ -279,7 +279,7 @@ if __name__ == "__main__":
             ],
             styles=[("green", "-"), ("blue", "-")],
             ylabel="ms",
-            plot_name="** backward with block size 64 **",
+            plot_name="** backward with block size 256 **",
             args={"H": 8, "D": 96},
         )
     )
@@ -298,8 +298,8 @@ if __name__ == "__main__":
         dv = torch.zeros_like(v)
         
         # Generate topk indices for sparse attention
-        topk = 16
-        top_idx = generate_topk_idx_example(cu_seqlens[1:], 64, topk, H // 2)
+        topk = 4
+        top_idx = generate_topk_idx_example(cu_seqlens[1:], 256, topk, H // 2)
 
         try:
             if provider == "flash":
@@ -345,7 +345,7 @@ if __name__ == "__main__":
                 def run_forward_backward():
                     # Forward pass
                     out = topk_sparse_attention_flash(
-                        q_bench, k_bench, v_bench, top_idx, 64, cu_seqlens, sm_scale
+                        q_bench, k_bench, v_bench, top_idx, 256, cu_seqlens, sm_scale
                     )
                     # Backward pass
                     out.backward(do, retain_graph=True)
