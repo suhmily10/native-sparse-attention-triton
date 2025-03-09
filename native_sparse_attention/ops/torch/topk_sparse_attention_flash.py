@@ -102,7 +102,9 @@ def topk_sparse_attention_flash(
     
     # 基本设置
     kv = torch.stack((k, v), dim=1)  # [total_len, 2, num_kv_heads, head_dim]
-    total_len, num_head, head_dim = q.shape
+    total_len, num_q_head, head_dim = q.shape
+    # Get the number of KV heads from the shape of k/v/topk_idx
+    num_kv_head = topk_idx.shape[0]
     
     # 如果没有指定softmax_scale，使用默认值
     if softmax_scale is None:
@@ -126,16 +128,18 @@ def topk_sparse_attention_flash(
     
     # 处理topk_idx，创建注意力mask
     gate_mask = torch.zeros(
-        (num_filtered_chunk, num_head, total_len), 
+        (num_filtered_chunk, num_q_head, total_len), 
         dtype=torch.bool, 
         device=q.device
     )
     
     # 对每个head、每个位置，将对应的topk块在gate_mask中标记为True
-    for h in range(num_head):
+    for h_q in range(num_q_head):
+        # Map query head to corresponding kv head
+        h_kv = h_q % num_kv_head  # This handles the case where num_q_head > num_kv_head
         for s in range(total_len):
             # 获取当前位置的topk块
-            blocks = topk_idx[h, s]  # [topk]
+            blocks = topk_idx[h_kv, s]  # [topk]
             valid_blocks = blocks[blocks >= 0]  # 排除填充值-1
             
             # 在gate_mask中标记这些块
@@ -147,7 +151,7 @@ def topk_sparse_attention_flash(
                     is_in_filtered = (filtered_chunk_indices == block_idx)
                     if is_in_filtered.any():
                         filtered_idx = torch.where(is_in_filtered)[0][0]
-                        gate_mask[filtered_idx, h, s] = True
+                        gate_mask[filtered_idx, h_q, s] = True
     
     # 组合所有需要注意力的查询索引
     moba_q_indices = gate_mask.reshape(gate_mask.shape[0], -1).nonzero(as_tuple=True)[-1]  # (head * seq) indices
@@ -158,7 +162,7 @@ def topk_sparse_attention_flash(
     moba_q = moba_q.unsqueeze(1)  # [selected_queries, 1, head_dim]
     
     # 记录这些查询在原始张量中的位置
-    moba_q_sh_indices = moba_q_indices % total_len * num_head + moba_q_indices // total_len
+    moba_q_sh_indices = moba_q_indices % total_len * num_q_head + moba_q_indices // total_len
     
     # 过滤掉没有查询的块
     q_zero_mask = moba_seqlen_q == 0
@@ -180,7 +184,14 @@ def topk_sparse_attention_flash(
     # 重组KV矩阵以适应查询排列
     moba_kv = rearrange(filtered_kv, "s x h d -> h s x d")
     moba_kv = moba_kv.split(block_size, dim=1)
-    moba_kv = torch.cat(moba_kv, dim=0)
+    moba_kv = torch.cat(moba_kv, dim=0)  # [num_filtered_chunk * num_kv_heads, block_size, 2, head_dim]
+    
+    # 处理不同数量的q和kv heads
+    if num_q_head > num_kv_head:
+        # 计算每个kv head对应的q head数量
+        q_heads_per_kv_head = num_q_head // num_kv_head
+        # 复制kv，使其匹配q heads的数量
+        moba_kv = torch.repeat_interleave(moba_kv, q_heads_per_kv_head, dim=0)
     
     if zero_expert_count > 0:
         moba_kv = moba_kv[valid_expert_mask]
@@ -189,7 +200,7 @@ def topk_sparse_attention_flash(
     
     # 构建cu_seqlen_kv用于flash attention
     moba_cu_seqlen_kv = torch.arange(
-        0, num_filtered_chunk * num_head + 1 - zero_expert_count,
+        0, num_filtered_chunk * num_q_head + 1 - zero_expert_count,
         dtype=torch.int32, device=q.device
     ) * block_size
     
