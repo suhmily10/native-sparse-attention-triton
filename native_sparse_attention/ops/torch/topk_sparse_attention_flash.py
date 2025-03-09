@@ -162,11 +162,13 @@ def topk_sparse_attention_flash(
     moba_kv = filtered_kv.reshape(-1, 2, num_kv_head, head_dim)
     moba_kv = moba_kv.transpose(1, 2).reshape(-1, block_size, 2, head_dim)
     
-    # 处理不同数量的q和kv heads
-    if num_q_head > num_kv_head:
-        moba_kv = torch.repeat_interleave(moba_kv, num_q_head // num_kv_head, dim=0)
+    # 处理不同数量的q和kv heads (修改后)
+    # Flash Attention 2+ 原生支持GQA，直接传递原始head数量即可
+    if num_q_head != num_kv_head:
+        assert num_q_head % num_kv_head == 0, "q_heads must be multiple of kv_heads for GQA"
+        # 不再需要重复interleave操作
     
-    # 准备最终KV格式
+    # 准备最终KV格式 (保持原有形状)
     moba_kv = moba_kv.flatten(start_dim=0, end_dim=1).unsqueeze(2)  # [num_chunks*block_size, 2, 1, head_dim]
     
     # 使用flash attention计算输出
