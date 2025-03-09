@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=128)
 def calc_chunks(cu_seqlen, moba_chunk_size, topk_idx=None):
     """calc chunks for moba attention with option to filter by topk indices
     
@@ -147,41 +147,30 @@ def topk_sparse_attention_flash(
         softmax_scale = q.shape[-1] ** (-0.5)
     logger.debug(f"softmax_scale={softmax_scale}")
     
-    # 准备块元数据
-    logger.debug("Calculating chunks")
-    (
-        cu_chunk,
-        all_chunk_indices,
-        num_chunk,
-        _,
-        chunk_to_batch,
-    ) = calc_chunks(cu_seqlens, block_size, topk_idx)
-    logger.debug(f"cu_chunk shape={cu_chunk.shape}, all_chunk_indices shape={all_chunk_indices.shape}")
-    logger.debug(f"num_chunk={num_chunk}")
+    # 直接从topk_idx中提取唯一的块索引
+    logger.debug("Extracting unique block indices from topk_idx")
+    # Reshape to flatten all dimensions and remove padding (-1 values)
+    flat_topk = topk_idx.reshape(-1)
+    valid_indices = flat_topk >= 0
+    unique_chunks = flat_topk[valid_indices].unique()
+    num_chunk = len(unique_chunks)
     
-    # 优化1：减少日志开销
-    # 将调试日志改为TRACE级别，并添加条件判断
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("Starting topk_sparse_attention_flash with shapes: q=%s, k=%s...", q.shape, k.shape)
-
-    # 优化2：使用更高效的内存分配方式
+    logger.debug(f"Found {num_chunk} unique chunk indices")
+    
+    # 创建块到偏移量的映射
+    logger.debug("Creating block offset mapping")
+    block_offsets = unique_chunks * block_size
+    
+    # 创建KV索引
     logger.debug("Creating filtered KV indices")
-    filtered_kv_indices = (cu_chunk[all_chunk_indices][:, None] + 
+    filtered_kv_indices = (block_offsets[:, None] + 
                           torch.arange(0, block_size, device=q.device)).flatten()
     
     # 优化3：使用index_select代替直接索引
     logger.debug("Selecting filtered KV tensors")
     filtered_kv = kv.index_select(0, filtered_kv_indices)
     
-    # 移除gate_mask相关逻辑
-    logger.debug("Creating full query indices")
-    
-    # 简化索引逻辑 - 更高效的实现
-    # 之前的代码等效于创建 (h, s) -> (h*s) 的展平索引
-    # 可以直接使用 rearrange 的展平功能，无需创建复杂的索引张量
-    
     # 每个chunk的查询数量固定为block_size
-    moba_seqlen_q = torch.full((num_chunk * num_q_head,), block_size, device=q.device)
     moba_cu_seqlen_q = torch.arange(0, (num_chunk * num_q_head + 1) * block_size, block_size, device=q.device, dtype=torch.int32)
 
     # 直接使用展平的查询矩阵，不需要额外的索引
@@ -235,10 +224,15 @@ def topk_sparse_attention_flash(
                 activities=[torch.profiler.ProfilerActivity.CUDA],
                 with_stack=False,  # 关闭堆栈跟踪以减少开销
                 record_shapes=False,  # 除非必要，否则不记录形状
-                profile_memory=False,  # 关闭内存分析
+                profile_memory=True,  # 启用内存分析
                 with_flops=True,
                 use_cuda=True
             ) as prof:
+                torch.cuda.synchronize()  # 确保GPU操作开始前同步
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                
+                start_event.record()
                 moba_attn_out = flash_attn_varlen_func(
                     q=moba_q,
                     k=moba_kv[:, 0],
@@ -250,8 +244,14 @@ def topk_sparse_attention_flash(
                     causal=False,
                     dropout_p=0.0,
                 )
-                # 只在最后一次进行同步，减少同步次数
-            # 不在这里调用torch.cuda.synchronize()，仅在需要结果时同步
+                end_event.record()
+                torch.cuda.synchronize()  # 确保GPU操作完成
+                gpu_time_ms = start_event.elapsed_time(end_event)
+                
+            # 输出更详细的GPU分析结果
+            logger.info(f"GPU Time: {gpu_time_ms:.2f} ms")
+            logger.info(f"Profiling results:\n{prof.key_averages().table(sort_by='cuda_time_total', row_limit=10)}")
+            logger.info(f"GPU Memory Stats: {torch.cuda.memory_summary(abbreviated=True)}")
         else:
             # 使用异步执行和混合精度
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
