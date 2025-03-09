@@ -19,94 +19,206 @@ from flash_attn.flash_attn_interface import (
     _flash_attn_varlen_forward,
     _flash_attn_varlen_backward,
 )
+from einops import rearrange
+from functools import lru_cache
+
+@lru_cache(maxsize=16)
+def calc_chunks(cu_seqlen, moba_chunk_size):
+    """calc chunks that needs moba attention"""
+
+    # batch_sizes[batch_idx] = batch size ( seqlen ) of batch idx
+    batch_sizes = cu_seqlen[1:] - cu_seqlen[:-1]
+    # batch_num_chunk[batch_idx] = how many chunk in batch idx
+    batch_num_chunk = (batch_sizes + (moba_chunk_size - 1)) // moba_chunk_size
+    # cu_num_chunk[batch_idx] = first chunk id of this batch
+    cu_num_chunk = torch.ones(
+        batch_num_chunk.numel() + 1,
+        device=cu_seqlen.device,
+        dtype=batch_num_chunk.dtype,
+    )
+    cu_num_chunk[1:] = batch_num_chunk.cumsum(dim=0)
+    # total chunk ( for all batch )
+    num_chunk = cu_num_chunk[-1]
+    # chunk_sizes[chunk_idx] = chunk_size of chunk idx
+    chunk_sizes = torch.full(
+        (num_chunk + 1,), moba_chunk_size, dtype=torch.int32, device=cu_seqlen.device
+    )
+    chunk_sizes[0] = 0  # for calc cu chunk
+    batch_last_chunk_size = batch_sizes - (batch_num_chunk - 1) * moba_chunk_size
+    chunk_sizes[cu_num_chunk[1:]] = batch_last_chunk_size
+    # cu_chunk[chunk_idx] = the start chunk offset of chunk idx
+    cu_chunk = chunk_sizes.cumsum(dim=-1, dtype=torch.int32)
+    # chunk_to_batch[chunk_idx] = batch idx of the chunk idx
+    chunk_to_batch = torch.zeros(
+        (num_chunk,), dtype=torch.int32, device=cu_seqlen.device
+    )
+    chunk_to_batch[cu_num_chunk[1:-1]] = 1
+    chunk_to_batch = chunk_to_batch.cumsum(dim=0, dtype=torch.int32)
+
+    """ filter chunks that need moba attn """
+
+    # filter chunks ( remove last chunk of each batch )
+    # filtered_chunk_indices: chunk index list that excludes the last chunk of each batch
+    chunk_to_remove = cu_num_chunk[1:] - 1
+    chunk_to_remain = torch.ones(
+        (num_chunk,), dtype=torch.bool, device=cu_seqlen.device
+    )
+    chunk_to_remain[chunk_to_remove] = False
+    filtered_chunk_indices = chunk_to_remain.nonzero(as_tuple=True)[0]
+    num_filtered_chunk = len(filtered_chunk_indices)
+
+    return (
+        cu_chunk,
+        filtered_chunk_indices,
+        num_filtered_chunk,
+        filtered_chunk_indices,
+        chunk_to_batch,
+    )
 
 
 def topk_sparse_attention_flash(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    topk_idx: torch.Tensor,
+    topk_idx: torch.Tensor,  # 形状 [num_kv_heads, total_len, topk]
     block_size: int,
     cu_seqlens: torch.Tensor,
     softmax_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Simple topk sparse attention varlen version implemented in torch. Optimized version.
-
+    """使用预计算的topk索引实现的稀疏注意力计算
+    
     Args:
-        q (torch.Tensor): shape [total_len, num_q_heads, head_dim]
-        k (torch.Tensor): shape [total_len, num_kv_heads, head_dim]
-        v (torch.Tensor): shape [total_len, num_kv_heads, head_dim]
-        topk_idx (torch.Tensor): topk block idx for each query, shape [num_kv_heads, total_len, topk]. -1 means padding.
-        block_size (int): key value block size.
-        cu_seqlens (torch.Tensor): shape [batch_size + 1], similar to cu_seqlens in flash_attn_func_varlen.
-        softmax_scale (Optional[float], optional): Defaults to None, means 1/sqrt(head_dim).
-
+        q (torch.Tensor): [total_len, num_q_heads, head_dim]
+        k (torch.Tensor): [total_len, num_kv_heads, head_dim]
+        v (torch.Tensor): [total_len, num_kv_heads, head_dim]
+        topk_idx (torch.Tensor): 每个查询的topk块索引，形状 [num_kv_heads, total_len, topk]，-1表示填充
+        block_size (int): key-value块大小
+        cu_seqlens (torch.Tensor): 形状 [batch_size + 1]，与flash_attn中的cu_seqlens相似
+        softmax_scale (Optional[float]): 默认为None，表示1/sqrt(head_dim)
+        
     Returns:
-        torch.Tensor: attention output, shape [total_len, num_q_heads, head_dim]
+        torch.Tensor: 注意力输出，形状 [total_len, num_q_heads, head_dim]
     """
-    total_seqlen, num_q_heads, head_dim = q.shape
-    _, num_kv_heads, _ = k.shape
-    num_share_q_heads = num_q_heads // num_kv_heads
-    batch_size = cu_seqlens.shape[0] - 1
-    topk = topk_idx.shape[-1]
+    
+    # 基本设置
+    kv = torch.stack((k, v), dim=1)  # [total_len, 2, num_kv_heads, head_dim]
+    total_len, num_head, head_dim = q.shape
+    
+    # 如果没有指定softmax_scale，使用默认值
     if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(head_dim)
+        softmax_scale = q.shape[-1] ** (-0.5)
     
-
+    # 准备块元数据
+    (
+        cu_chunk,
+        filtered_chunk_indices,
+        num_filtered_chunk,
+        _,
+        chunk_to_batch,
+    ) = calc_chunks(cu_seqlens, block_size)
     
-    # Initialize the output tensor
-    o = torch.zeros_like(q)
+    # 创建过滤后的KV (所有可能参与计算的KV块)
+    filtered_kv_indices = torch.arange(
+        0, block_size, dtype=torch.int32, device=q.device
+    )[None, :].repeat(num_filtered_chunk, 1)
+    filtered_kv_indices += cu_chunk[filtered_chunk_indices][:, None]
+    filtered_kv = kv.index_select(0, filtered_kv_indices.view(-1))  # [num_filtered_chunk * block_size, 2, num_kv_heads, head_dim]
     
-    # 生成块掩码并重组张量
-    batch_indices = torch.repeat_interleave(
-        torch.arange(batch_size, device=q.device),
-        cu_seqlens[1:] - cu_seqlens[:-1]
+    # 处理topk_idx，创建注意力mask
+    gate_mask = torch.zeros(
+        (num_filtered_chunk, num_head, total_len), 
+        dtype=torch.bool, 
+        device=q.device
     )
     
-    # 生成块偏移量 [batch_size, max_blocks+1]
-    max_blocks = (cu_seqlens[1:] - cu_seqlens[:-1] + block_size - 1) // block_size
-    block_offsets = torch.cat([torch.zeros(1, device=q.device)] + [
-        torch.arange(0, seqlen, block_size, device=q.device) 
-        for seqlen in (cu_seqlens[1:] - cu_seqlens[:-1])
-    ])
+    # 对每个head、每个位置，将对应的topk块在gate_mask中标记为True
+    for h in range(num_head):
+        for s in range(total_len):
+            # 获取当前位置的topk块
+            blocks = topk_idx[h, s]  # [topk]
+            valid_blocks = blocks[blocks >= 0]  # 排除填充值-1
+            
+            # 在gate_mask中标记这些块
+            if len(valid_blocks) > 0:
+                # 将块索引转换为filtered_chunk_indices中的索引
+                mask_indices = torch.zeros_like(valid_blocks, dtype=torch.bool)
+                for i, block_idx in enumerate(valid_blocks):
+                    # 检查block_idx是否在filtered_chunk_indices中
+                    is_in_filtered = (filtered_chunk_indices == block_idx)
+                    if is_in_filtered.any():
+                        filtered_idx = torch.where(is_in_filtered)[0][0]
+                        gate_mask[filtered_idx, h, s] = True
     
-    # 重组KV数据 [num_blocks, num_kv_heads, block_size, head_dim]
-    k_blocks = k.unfold(0, block_size, block_size)
-    v_blocks = v.unfold(0, block_size, block_size)
+    # 组合所有需要注意力的查询索引
+    moba_q_indices = gate_mask.reshape(gate_mask.shape[0], -1).nonzero(as_tuple=True)[-1]  # (head * seq) indices
+    moba_seqlen_q = gate_mask.sum(dim=-1).flatten()  # 每个(chunk,head)对应的查询数量
     
-    # 根据topk_idx选择块 [num_kv_heads, total_len, topk] -> [num_kv_heads, total_len*topk]
-    valid_mask = topk_idx != -1
-    selected_blocks = topk_idx[valid_mask]
+    # 选择所有需要注意力的查询向量
+    moba_q = rearrange(q, "s h d -> (h s) d").index_select(0, moba_q_indices)  # [selected_queries, head_dim]
+    moba_q = moba_q.unsqueeze(1)  # [selected_queries, 1, head_dim]
     
-    # 修正后的批次索引扩展方式
-    batch_expanded = batch_indices.unsqueeze(0).unsqueeze(-1).expand_as(topk_idx)[valid_mask]
+    # 记录这些查询在原始张量中的位置
+    moba_q_sh_indices = moba_q_indices % total_len * num_head + moba_q_indices // total_len
     
-    # 计算实际块索引
-    block_starts = block_offsets[batch_expanded] + selected_blocks * block_size
-    block_indices = (block_starts.unsqueeze(-1) + torch.arange(block_size, device=q.device)).long()
+    # 过滤掉没有查询的块
+    q_zero_mask = moba_seqlen_q == 0
+    valid_expert_mask = ~q_zero_mask
+    zero_expert_count = q_zero_mask.sum()
     
-    # 收集选中的KV块 [num_selected_blocks, num_kv_heads, block_size, head_dim]
-    k_selected = k[block_indices.clamp_max(k.size(0)-1)]
-    v_selected = v[block_indices.clamp_max(v.size(0)-1)]
+    if zero_expert_count > 0:
+        moba_seqlen_q = moba_seqlen_q[valid_expert_mask]
     
-    # 重组为批量计算形状 [num_kv_heads, total_len, topk, block_size, head_dim]
-    k_selected = k_selected.view(num_kv_heads, total_seqlen, topk, block_size, head_dim)
-    v_selected = v_selected.view(num_kv_heads, total_seqlen, topk, block_size, head_dim)
+    # 构建cu_seqlen_q用于flash attention
+    moba_cu_seqlen_q = torch.cat(
+        (
+            torch.tensor([0], device=q.device, dtype=moba_seqlen_q.dtype),
+            moba_seqlen_q.cumsum(dim=0),
+        ),
+        dim=0
+    ).to(torch.int32)
     
-    # 扩展Q张量用于批量计算 [num_kv_heads, total_len, num_share_q_heads, head_dim]
-    q_expanded = q.view(total_seqlen, num_kv_heads, num_share_q_heads, head_dim)
+    # 重组KV矩阵以适应查询排列
+    moba_kv = rearrange(filtered_kv, "s x h d -> h s x d")
+    moba_kv = moba_kv.split(block_size, dim=1)
+    moba_kv = torch.cat(moba_kv, dim=0)
     
-    # Reshape q_expanded to align with k_selected
-    # [total_len, num_kv_heads, num_share_q_heads, head_dim] -> [1, total_len, num_kv_heads, num_share_q_heads, head_dim]
-    q_expanded = q_expanded.unsqueeze(0)
-    # import pdb; pdb.set_trace()
-    # Compute attention scores
-    # Note: We compute dot product between query vectors and key vectors along the head_dim dimension
-    attn_scores = torch.einsum('blkhd,blnsd->blknhs', q_expanded, k_selected) * softmax_scale
+    if zero_expert_count > 0:
+        moba_kv = moba_kv[valid_expert_mask]
     
-    # 计算注意力权重并加权求和
-    attn_weights = torch.softmax(attn_scores, dim=-1)
-    o = torch.einsum('blknhs,blnsd->blkhd', attn_weights, v_selected)
+    moba_kv = moba_kv.flatten(start_dim=0, end_dim=1).unsqueeze(2)  # [num_chunks*block_size, 2, 1, head_dim]
     
-    # 重组输出张量 [total_len, num_q_heads, head_dim]
-    return o.view(total_seqlen, num_q_heads, head_dim)
+    # 构建cu_seqlen_kv用于flash attention
+    moba_cu_seqlen_kv = torch.arange(
+        0, num_filtered_chunk * num_head + 1 - zero_expert_count,
+        dtype=torch.int32, device=q.device
+    ) * block_size
+    
+    # 检查形状一致性
+    assert moba_cu_seqlen_kv.shape == moba_cu_seqlen_q.shape
+    
+    # 使用自定义MixedAttention实现注意力计算
+    output = torch.zeros(
+        (q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32
+    )
+    
+    # 只计算MoBA部分，无自注意力
+    moba_attn_out = flash_attn_varlen_func(
+        q=moba_q.to(torch.bfloat16),
+        k=moba_kv[:, 0].to(torch.bfloat16),
+        v=moba_kv[:, 1].to(torch.bfloat16),
+        cu_seqlens_q=moba_cu_seqlen_q,
+        cu_seqlens_k=moba_cu_seqlen_kv,
+        max_seqlen_q=total_len,
+        max_seqlen_k=block_size,
+        causal=False,
+        dropout_p=0.0,
+    )
+    
+    # 将结果重新分配到输出张量
+    output_2d = output.view(-1, q.shape[2])
+    raw_attn_out = moba_attn_out.view(-1, moba_attn_out.shape[-1])
+    raw_attn_out = raw_attn_out.to(output_2d.dtype)
+    output_2d.index_add_(0, moba_q_sh_indices, raw_attn_out)
+    output = output.to(q.dtype)
+    
+    return output

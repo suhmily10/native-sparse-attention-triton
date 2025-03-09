@@ -71,10 +71,17 @@ def topk_sparse_attention_torch(
     mask = mask.repeat_interleave(num_share_q_heads, 0)
     # qk attn
     qk = (
-        torch.einsum("qhd,khd->hqk", q, k.repeat_interleave(num_share_q_heads, 1))
-        * softmax_scale
+        torch.einsum(
+            "qhd,khd->hqk", 
+            q.to(k.dtype),
+            k.repeat_interleave(num_share_q_heads, 1)
+        ) * softmax_scale
     )
     qk = torch.masked_fill(qk, ~mask, -torch.inf)
     qk = torch.softmax(qk, dim=-1, dtype=torch.float32).to(q.dtype)
-    o = torch.einsum("hqk,khd->qhd", qk, v.repeat_interleave(num_share_q_heads, 1))
+    o = torch.einsum(
+        "hqk,khd->qhd", 
+        qk, 
+        v.repeat_interleave(num_share_q_heads, 1).to(q.dtype)
+    )
     return o
