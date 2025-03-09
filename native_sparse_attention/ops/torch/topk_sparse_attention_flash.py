@@ -152,76 +152,23 @@ def topk_sparse_attention_flash(
     filtered_kv = kv.index_select(0, filtered_kv_indices.view(-1))  # [num_filtered_chunk * block_size, 2, num_kv_heads, head_dim]
     logger.info(f"filtered_kv shape={filtered_kv.shape}")
     
-    # 处理topk_idx，创建注意力mask
-    logger.info("Creating gate mask")
-    gate_mask = torch.zeros(
-        (num_filtered_chunk, num_q_head, total_len), 
-        dtype=torch.bool, 
-        device=q.device
-    )
-    logger.info(f"gate_mask shape={gate_mask.shape}")
+    # 移除gate_mask相关逻辑
+    logger.info("Creating full query indices")
+    # 直接使用所有查询
+    moba_q_indices = torch.arange(total_len, device=q.device).repeat(num_q_head)
+    moba_q_indices = moba_q_indices + (torch.arange(num_q_head, device=q.device) * total_len).repeat_interleave(total_len)
     
-    # 对每个位置，将对应的topk块在gate_mask中标记为True
-    logger.info("Updating gate mask based on topk blocks")
-    # Vectorized implementation with bounds checking
-    h_kv = 0  # Use first KV head for indices
-    valid_mask = topk_idx[h_kv] != -1  # [total_len, topk]
-    valid_s, valid_k = torch.where(valid_mask)
-    valid_block_indices = topk_idx[h_kv, valid_s, valid_k]  # [num_valid]
+    # 每个chunk的查询数量固定为block_size
+    moba_seqlen_q = torch.full((num_filtered_chunk * num_q_head,), block_size, device=q.device)
+    moba_cu_seqlen_q = torch.arange(0, (num_filtered_chunk * num_q_head + 1) * block_size, block_size, device=q.device, dtype=torch.int32)
+
+    # 直接使用原始q矩阵
+    logger.info("Selecting all query vectors")
+    moba_q = rearrange(q, "s h d -> (h s) d").index_select(0, moba_q_indices)  # [total_queries, head_dim]
+    moba_q = moba_q.unsqueeze(1)  # [total_queries, 1, head_dim]
     
-    # Create sorted version of filtered chunks for search
-    sorted_filtered, _ = torch.sort(filtered_chunk_indices)
-    # Find positions where valid blocks exist in filtered chunks
-    pos = torch.searchsorted(sorted_filtered, valid_block_indices)
-    # Create mask for valid positions
-    valid_pos_mask = (pos < len(sorted_filtered)) & (sorted_filtered[pos] == valid_block_indices)
-    
-    # Get final valid indices
-    filtered_idx = pos[valid_pos_mask]
-    valid_s_filtered = valid_s[valid_pos_mask]
-    
-    # Update gate mask safely
-    if filtered_idx.numel() > 0:
-        gate_mask[filtered_idx, :, valid_s_filtered] = True
-    
-    logger.info("Finding queries that need attention")
-    # 组合所有需要注意力的查询索引
-    moba_q_indices = gate_mask.reshape(gate_mask.shape[0], -1).nonzero(as_tuple=True)[-1]  # (head * seq) indices
-    logger.info(f"moba_q_indices shape={moba_q_indices.shape}")
-    
-    moba_seqlen_q = gate_mask.sum(dim=-1).flatten()  # 每个(chunk,head)对应的查询数量
-    logger.info(f"moba_seqlen_q shape={moba_seqlen_q.shape}, sum={moba_seqlen_q.sum().item()}")
-    
-    # 选择所有需要注意力的查询向量
-    logger.info("Selecting query vectors")
-    moba_q = rearrange(q, "s h d -> (h s) d").index_select(0, moba_q_indices)  # [selected_queries, head_dim]
-    moba_q = moba_q.unsqueeze(1)  # [selected_queries, 1, head_dim]
-    logger.info(f"moba_q shape={moba_q.shape}")
-    
-    # 记录这些查询在原始张量中的位置
-    moba_q_sh_indices = moba_q_indices % total_len * num_q_head + moba_q_indices // total_len
-    logger.info(f"moba_q_sh_indices shape={moba_q_sh_indices.shape}")
-    
-    # 过滤掉没有查询的块
-    q_zero_mask = moba_seqlen_q == 0
-    valid_expert_mask = ~q_zero_mask
-    zero_expert_count = q_zero_mask.sum()
-    logger.info(f"zero_expert_count={zero_expert_count}, valid_experts={valid_expert_mask.sum().item()}")
-    
-    if zero_expert_count > 0:
-        moba_seqlen_q = moba_seqlen_q[valid_expert_mask]
-        logger.info(f"filtered moba_seqlen_q shape={moba_seqlen_q.shape}")
-    
-    # 构建cu_seqlen_q用于flash attention
-    logger.info("Building cu_seqlen_q")
-    moba_cu_seqlen_q = torch.cat(
-        (
-            torch.tensor([0], device=q.device, dtype=moba_seqlen_q.dtype),
-            moba_seqlen_q.cumsum(dim=0),
-        ),
-        dim=0
-    ).to(torch.int32)
-    logger.info(f"moba_cu_seqlen_q shape={moba_cu_seqlen_q.shape}")
+    # 记录原始位置（直接顺序映射）
+    moba_q_sh_indices = moba_q_indices
     
     # 重组KV矩阵以适应查询排列
     logger.info("Reorganizing KV tensors")
@@ -239,18 +186,13 @@ def topk_sparse_attention_flash(
         moba_kv = torch.repeat_interleave(moba_kv, q_heads_per_kv_head, dim=0)
         logger.info(f"repeated moba_kv shape={moba_kv.shape}")
     
-    if zero_expert_count > 0:
-        logger.info("Filtering out zero experts in KV")
-        moba_kv = moba_kv[valid_expert_mask]
-        logger.info(f"filtered moba_kv shape={moba_kv.shape}")
-    
     moba_kv = moba_kv.flatten(start_dim=0, end_dim=1).unsqueeze(2)  # [num_chunks*block_size, 2, 1, head_dim]
     logger.info(f"final moba_kv shape={moba_kv.shape}")
     
     # 构建cu_seqlen_kv用于flash attention
     logger.info("Building cu_seqlen_kv")
     moba_cu_seqlen_kv = torch.arange(
-        0, num_filtered_chunk * num_q_head + 1 - zero_expert_count,
+        0, num_filtered_chunk * num_q_head + 1,
         dtype=torch.int32, device=q.device
     ) * block_size
     logger.info(f"moba_cu_seqlen_kv shape={moba_cu_seqlen_kv.shape}")
@@ -286,12 +228,12 @@ def topk_sparse_attention_flash(
         logger.error(f"cu_seqlens_q={moba_cu_seqlen_q}, cu_seqlens_k={moba_cu_seqlen_kv}")
         raise
     
-    # 将结果重新分配到输出张量
+    # 修改结果分配逻辑（直接覆盖代替累加）
     logger.info("Distributing attention results to output tensor")
     output_2d = output.view(-1, q.shape[2])
     raw_attn_out = moba_attn_out.view(-1, moba_attn_out.shape[-1])
     raw_attn_out = raw_attn_out.to(output_2d.dtype)
-    output_2d.index_add_(0, moba_q_sh_indices, raw_attn_out)
+    output_2d[moba_q_sh_indices] = raw_attn_out  # 直接赋值代替index_add
     output = output.to(q.dtype)
     
     logger.info(f"Completed topk_sparse_attention_flash in {time.time() - start_time:.2f}s, output shape={output.shape}")
