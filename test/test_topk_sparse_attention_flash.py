@@ -189,281 +189,229 @@ if __name__ == "__main__":
 
     # benchmark forward pass
     logger.debug("Setting up forward pass benchmark")
-    @triton.testing.perf_report(
-        triton.testing.Benchmark(
-            x_names=["N"],
-            x_vals=[1024 * 2**i for i in range(1, 6)],
-            line_arg="provider",
-            line_vals=[
-                "flash", 
-                "topk-flash"
-            ],
-            line_names=[
-                "Flash",
-                "TopK-Flash",
-            ],
-            styles=[("green", "-"), ("blue", "-")],
-            ylabel="ms",
-            plot_name="** forward with block size 256 **",
-            args={"H": 8, "D": 96},
-        )
-    )
-    def benchmark_forward(N, H, D, provider):
-        logger.debug(f"Forward benchmark: N={N}, H={H}, D={D}, provider={provider}")
-        q = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
-        k = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
-        v = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
-        cu_seqlens = torch.tensor([0, N], device="cuda", dtype=torch.int32)
-        sm_scale = 1 / math.sqrt(D)
-
-        # Generate topk indices for sparse attention
-        topk = 4
-        top_idx = generate_topk_idx_example(cu_seqlens[1:], 256, topk, H // 2)
-
-        try:
-            if provider == "flash":
-                logger.debug(f"Running flash-attention forward benchmark with N={N}")
-                start_time = time.time()
-                ms = bench(
-                    lambda: _flash_attn_varlen_forward(
-                        q,
-                        k,
-                        v,
-                        cu_seqlens,
-                        cu_seqlens,
-                        N,
-                        N,
-                        dropout_p=0.0,
-                        causal=True,
-                        softmax_scale=sm_scale,
-                    )
-                )
-                min_ms = ms
-                max_ms = ms
-                logger.debug(f"Completed flash-attention forward benchmark in {time.time() - start_time:.2f}s")
-            if provider == "topk-flash":
-                logger.debug(f"Running topk-flash-attention forward benchmark with N={N}")
-                start_time = time.time()
-                ms = bench(
-                    lambda: topk_sparse_attention_flash(
-                        q, k, v, top_idx, 256, cu_seqlens, sm_scale
-                    )
-                )
-                min_ms = ms
-                max_ms = ms
-                logger.debug(f"Completed topk-flash-attention forward benchmark in {time.time() - start_time:.2f}s")
-        finally:
-            # Clean up all tensors
-            del q, k, v, cu_seqlens, top_idx
-            # Force garbage collection before emptying cache
-            gc.collect()
-            torch.cuda.empty_cache()
+    def benchmark_forward():
+        N_vals = [1024 * 2**i for i in range(1, 6)]
+        H = 8
+        D = 96
+        providers = ["flash", "topk-flash"]
         
-        return ms, min_ms, max_ms
+        print("\n** Forward benchmark with block size 256 **")
+        print(f"{'N':<10} {'Flash (ms)':<15} {'TopK-Flash (ms)':<15}")
+        print("-" * 40)
+        
+        for N in N_vals:
+            results = {}
+            
+            for provider in providers:
+                logger.debug(f"Forward benchmark: N={N}, H={H}, D={D}, provider={provider}")
+                q = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
+                k = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
+                v = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
+                cu_seqlens = torch.tensor([0, N], device="cuda", dtype=torch.int32)
+                sm_scale = 1 / math.sqrt(D)
+
+                # Generate topk indices for sparse attention
+                topk = 4
+                top_idx = generate_topk_idx_example(cu_seqlens[1:], 256, topk, H // 2)
+
+                try:
+                    if provider == "flash":
+                        logger.debug(f"Running flash-attention forward benchmark with N={N}")
+                        start_time = time.time()
+                        ms = bench(
+                            lambda: _flash_attn_varlen_forward(
+                                q, k, v, cu_seqlens, cu_seqlens, N, N,
+                                dropout_p=0.0, causal=True, softmax_scale=sm_scale,
+                            )
+                        )
+                        logger.debug(f"Completed flash-attention forward benchmark in {time.time() - start_time:.2f}s")
+                    elif provider == "topk-flash":
+                        logger.debug(f"Running topk-flash-attention forward benchmark with N={N}")
+                        start_time = time.time()
+                        ms = bench(
+                            lambda: topk_sparse_attention_flash(
+                                q, k, v, top_idx, 256, cu_seqlens, sm_scale
+                            )
+                        )
+                        logger.debug(f"Completed topk-flash-attention forward benchmark in {time.time() - start_time:.2f}s")
+                    
+                    results[provider] = ms
+                finally:
+                    # Clean up all tensors
+                    del q, k, v, cu_seqlens, top_idx
+                    # Force garbage collection before emptying cache
+                    gc.collect()
+                    torch.cuda.empty_cache()
+            
+            print(f"{N:<10} {results.get('flash', 'N/A'):<15.2f} {results.get('topk-flash', 'N/A'):<15.2f}")
 
     logger.debug("Starting forward benchmark runs")
-    benchmark_forward.run(show_plots=True, print_data=True)
+    benchmark_forward()
     logger.debug("Completed forward benchmark runs")
 
     # benchmark backward pass
     logger.debug("Setting up backward pass benchmark")
-    @triton.testing.perf_report(
-        triton.testing.Benchmark(
-            x_names=["N"],
-            x_vals=[1024 * 2**i for i in range(1, 6)],
-            line_arg="provider",
-            line_vals=["flash", "topk-flash"],
-            line_names=[
-                "Flash",
-                "TopK-Flash",
-            ],
-            styles=[("green", "-"), ("blue", "-")],
-            ylabel="ms",
-            plot_name="** backward with block size 256 **",
-            args={"H": 8, "D": 96},
-        )
-    )
-    def benchmark_backward(N, H, D, provider):
-        logger.debug(f"Backward benchmark: N={N}, H={H}, D={D}, provider={provider}")
-        q = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
-        k = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
-        v = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
-        o = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
-        do = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
-        lse = torch.randn((N, H), device="cuda", dtype=torch.bfloat16)
-        sm_scale = 1 / math.sqrt(D)
-        cu_seqlens = torch.tensor([0, N], device="cuda", dtype=torch.int32)
-        dq = torch.zeros_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
+    def benchmark_backward():
+        N_vals = [1024 * 2**i for i in range(1, 6)]
+        H = 8
+        D = 96
+        providers = ["flash", "topk-flash"]
         
-        # Generate topk indices for sparse attention
-        topk = 4
-        top_idx = generate_topk_idx_example(cu_seqlens[1:], 256, topk, H // 2)
+        print("\n** Backward benchmark with block size 256 **")
+        print(f"{'N':<10} {'Flash (ms)':<15} {'TopK-Flash (ms)':<15}")
+        print("-" * 40)
+        
+        for N in N_vals:
+            results = {}
+            
+            for provider in providers:
+                logger.debug(f"Backward benchmark: N={N}, H={H}, D={D}, provider={provider}")
+                q = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
+                k = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
+                v = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
+                o = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
+                do = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
+                lse = torch.randn((N, H), device="cuda", dtype=torch.bfloat16)
+                sm_scale = 1 / math.sqrt(D)
+                cu_seqlens = torch.tensor([0, N], device="cuda", dtype=torch.int32)
+                dq = torch.zeros_like(q)
+                dk = torch.zeros_like(k)
+                dv = torch.zeros_like(v)
+                
+                # Generate topk indices for sparse attention
+                topk = 4
+                top_idx = generate_topk_idx_example(cu_seqlens[1:], 256, topk, H // 2)
 
-        try:
-            if provider == "flash":
-                logger.debug(f"Running flash-attention backward benchmark with N={N}")
-                start_time = time.time()
-                ms = bench(
-                    lambda: _flash_attn_varlen_backward(
-                        do,
-                        q,
-                        k,
-                        v,
-                        o,
-                        lse.transpose(0, 1),
-                        dq,
-                        dk,
-                        dv,
-                        cu_seqlens,
-                        cu_seqlens,
-                        N,
-                        N,
-                        dropout_p=0.0,
-                        causal=True,
-                        softmax_scale=sm_scale,
-                        window_size_left=-1,
-                        window_size_right=-1,
-                        softcap=0.0,
-                        alibi_slopes=None,
-                        deterministic=False,
-                    )
-                )
-                min_ms = ms
-                max_ms = ms
-                logger.debug(f"Completed flash-attention backward benchmark in {time.time() - start_time:.2f}s")
-            elif provider == "topk-flash":
-                logger.debug(f"Running topk-flash-attention backward benchmark with N={N}")
-                start_time = time.time()
-                
-                # For backward benchmarking, we need to run forward first with grad enabled
-                q_bench = q.clone().detach().requires_grad_()
-                k_bench = k.clone().detach().requires_grad_()
-                v_bench = v.clone().detach().requires_grad_()
-                
-                def run_forward_backward():
-                    # Forward pass
-                    out = topk_sparse_attention_flash(
-                        q_bench, k_bench, v_bench, top_idx, 256, cu_seqlens, sm_scale
-                    )
-                    # Backward pass
-                    out.backward(do, retain_graph=True)
+                try:
+                    if provider == "flash":
+                        logger.debug(f"Running flash-attention backward benchmark with N={N}")
+                        start_time = time.time()
+                        ms = bench(
+                            lambda: _flash_attn_varlen_backward(
+                                do, q, k, v, o, lse.transpose(0, 1), dq, dk, dv,
+                                cu_seqlens, cu_seqlens, N, N, dropout_p=0.0, causal=True,
+                                softmax_scale=sm_scale, window_size_left=-1, window_size_right=-1,
+                                softcap=0.0, alibi_slopes=None, deterministic=False,
+                            )
+                        )
+                        logger.debug(f"Completed flash-attention backward benchmark in {time.time() - start_time:.2f}s")
+                    elif provider == "topk-flash":
+                        logger.debug(f"Running topk-flash-attention backward benchmark with N={N}")
+                        start_time = time.time()
+                        
+                        # For backward benchmarking, we need to run forward first with grad enabled
+                        q_bench = q.clone().detach().requires_grad_()
+                        k_bench = k.clone().detach().requires_grad_()
+                        v_bench = v.clone().detach().requires_grad_()
+                        
+                        def run_forward_backward():
+                            # Forward pass
+                            out = topk_sparse_attention_flash(
+                                q_bench, k_bench, v_bench, top_idx, 256, cu_seqlens, sm_scale
+                            )
+                            # Backward pass
+                            out.backward(do, retain_graph=True)
+                            
+                        ms = bench(run_forward_backward)
+                        logger.debug(f"Completed topk-flash-attention backward benchmark in {time.time() - start_time:.2f}s")
                     
-                ms = bench(run_forward_backward)
-                min_ms = ms
-                max_ms = ms
-                logger.debug(f"Completed topk-flash-attention backward benchmark in {time.time() - start_time:.2f}s")
-        finally:
-            # Clean up all tensors
-            del q, k, v, o, do, lse, cu_seqlens, dq, dk, dv, top_idx
-            if provider == "topk-flash":
-                del q_bench, k_bench, v_bench
-            # Force garbage collection before emptying cache
-            gc.collect()
-            torch.cuda.empty_cache()
-        
-        return ms, min_ms, max_ms
+                    results[provider] = ms
+                finally:
+                    # Clean up all tensors
+                    del q, k, v, o, do, lse, cu_seqlens, dq, dk, dv, top_idx
+                    if provider == "topk-flash":
+                        try:
+                            del q_bench, k_bench, v_bench
+                        except:
+                            pass
+                    # Force garbage collection before emptying cache
+                    gc.collect()
+                    torch.cuda.empty_cache()
+            
+            print(f"{N:<10} {results.get('flash', 'N/A'):<15.2f} {results.get('topk-flash', 'N/A'):<15.2f}")
 
     logger.debug("Starting backward benchmark runs")
-    benchmark_backward.run(show_plots=True, print_data=True)
-    logger.debug("Completed backward benchmark runs and script execution")
+    benchmark_backward()
+    logger.debug("Completed backward benchmark runs")
 
     # benchmark batch sizes with fixed sequence length
     logger.debug("Setting up batch size benchmark")
-    @triton.testing.perf_report(
-        triton.testing.Benchmark(
-            x_names=["B"],  # Test different batch sizes
-            x_vals=[1,2,4,8,16],
-            line_arg="provider",
-            line_vals=[
-                "flash", 
-                "topk-flash"
-            ],
-            line_names=[
-                "Flash",
-                "TopK-Flash",
-            ],
-            styles=[("green", "-"), ("blue", "-")],
-            ylabel="ms",
-            plot_name="** batch size performance comparison 8192 **",
-            args={"N": 4096, "H": 8, "D": 96},  # Fixed sequence length
-        )
-    )
-    def benchmark_batch_sizes(B, N, H, D, provider):
-        logger.debug(f"Batch size benchmark: B={B}, N={N}, H={H}, D={D}, provider={provider}")
+    def benchmark_batch_sizes():
+        B_vals = [1, 2, 4, 8, 16]
+        N = 8192
+        H = 8
+        D = 96
+        providers = ["flash", "topk-flash"]
         
-        # Clear CUDA cache before creating new tensors
-        torch.cuda.empty_cache()
-        logger.debug(f"Starting benchmark B={B}, provider={provider}, memory: {torch.cuda.memory_reserved()//1024**3} GB")
+        print("\n** Batch size performance comparison with seq length 4096 **")
+        print(f"{'B':<10} {'Flash (ms)':<15} {'TopK-Flash (ms)':<15}")
+        print("-" * 40)
         
-        # Total number of tokens across all batches
-        total_tokens = B * N
-        
-        # Create cumulative sequence lengths for batched input
-        cu_seqlens = torch.zeros(B+1, device="cuda", dtype=torch.int32)
-        for i in range(B):
-            cu_seqlens[i+1] = cu_seqlens[i] + N
-        
-        sm_scale = 1 / math.sqrt(D)
-        
-        # Create input tensors
-        q = torch.randn((total_tokens, H, D), device="cuda", dtype=torch.bfloat16)
-        k = torch.randn((total_tokens, H // 2, D), device="cuda", dtype=torch.bfloat16)
-        v = torch.randn((total_tokens, H // 2, D), device="cuda", dtype=torch.bfloat16)
-        
-        # Parameters for topk sparse attention
-        block_size = 256
-        topk = 4
-        
-        # Generate topk indices for sparse attention
-        top_idx = generate_topk_idx_example(torch.ones(B, device="cuda", dtype=torch.int32) * N, 
-                                            block_size, topk, H // 2)
-        
-        try:
-            if provider == "flash":
-                logger.debug(f"Running flash-attention benchmark with B={B}, N={N}")
-                start_time = time.time()
-                ms = bench(
-                    lambda: _flash_attn_varlen_forward(
-                        q,
-                        k,
-                        v,
-                        cu_seqlens,
-                        cu_seqlens,
-                        total_tokens,
-                        total_tokens,
-                        dropout_p=0.0,
-                        causal=True,
-                        softmax_scale=sm_scale,
-                    )
-                )
-                min_ms = ms
-                max_ms = ms
-                logger.debug(f"Completed flash-attention benchmark in {time.time() - start_time:.2f}s")
-                
-            elif provider == "topk-flash":
-                logger.debug(f"Running topk-flash-attention benchmark with B={B}, N={N}")
-                start_time = time.time()
-                ms = bench(
-                    lambda: topk_sparse_attention_flash(
-                        q, k, v, top_idx, block_size, cu_seqlens, sm_scale
-                    )
-                )
-                min_ms = ms
-                max_ms = ms
-                logger.debug(f"Completed topk-flash-attention benchmark in {time.time() - start_time:.2f}s")
-        finally:
-            # Clean up all tensors
-            del q, k, v, cu_seqlens, top_idx
-            # Force garbage collection before emptying cache
-            gc.collect()
-            torch.cuda.empty_cache()
+        for B in B_vals:
+            results = {}
+            logger.debug(f"Batch size benchmark: B={B}, N={N}, H={H}, D={D}")
             
-        return ms, min_ms, max_ms
+            # Clear CUDA cache before creating new tensors
+            torch.cuda.empty_cache()
+            logger.debug(f"Starting benchmark B={B}, memory: {torch.cuda.memory_reserved()//1024**3} GB")
+            
+            for provider in providers:
+                # Total number of tokens across all batches
+                total_tokens = B * N
+                
+                # Create cumulative sequence lengths for batched input
+                cu_seqlens = torch.zeros(B+1, device="cuda", dtype=torch.int32)
+                for i in range(B):
+                    cu_seqlens[i+1] = cu_seqlens[i] + N
+                
+                sm_scale = 1 / math.sqrt(D)
+                
+                # Create input tensors
+                q = torch.randn((total_tokens, H, D), device="cuda", dtype=torch.bfloat16)
+                k = torch.randn((total_tokens, H // 2, D), device="cuda", dtype=torch.bfloat16)
+                v = torch.randn((total_tokens, H // 2, D), device="cuda", dtype=torch.bfloat16)
+                
+                # Parameters for topk sparse attention
+                block_size = 256
+                topk = 4
+                
+                # Generate topk indices for sparse attention
+                top_idx = generate_topk_idx_example(torch.ones(B, device="cuda", dtype=torch.int32) * N, 
+                                                   block_size, topk, H // 2)
+                
+                try:
+                    if provider == "flash":
+                        logger.debug(f"Running flash-attention benchmark with B={B}, N={N}")
+                        start_time = time.time()
+                        ms = bench(
+                            lambda: _flash_attn_varlen_forward(
+                                q, k, v, cu_seqlens, cu_seqlens, total_tokens, total_tokens,
+                                dropout_p=0.0, causal=True, softmax_scale=sm_scale,
+                            )
+                        )
+                        logger.debug(f"Completed flash-attention benchmark in {time.time() - start_time:.2f}s")
+                    elif provider == "topk-flash":
+                        logger.debug(f"Running topk-flash-attention benchmark with B={B}, N={N}")
+                        start_time = time.time()
+                        ms = bench(
+                            lambda: topk_sparse_attention_flash(
+                                q, k, v, top_idx, block_size, cu_seqlens, sm_scale
+                            )
+                        )
+                        logger.debug(f"Completed topk-flash-attention benchmark in {time.time() - start_time:.2f}s")
+                    
+                    results[provider] = ms
+                finally:
+                    # Clean up all tensors
+                    del q, k, v, cu_seqlens, top_idx
+                    # Force garbage collection before emptying cache
+                    gc.collect()
+                    torch.cuda.empty_cache()
+            
+            print(f"{B:<10} {results.get('flash', 'N/A'):<15.2f} {results.get('topk-flash', 'N/A'):<15.2f}")
 
     logger.debug("Starting batch size benchmark runs")
-    benchmark_batch_sizes.run(show_plots=True, print_data=True)
-    logger.debug("Completed batch size benchmark runs")
+    benchmark_batch_sizes()
+    logger.debug("Completed batch size benchmark runs and script execution")
 
  
