@@ -25,7 +25,7 @@ def topk_sparse_attention_flash(
     cu_seqlens: torch.Tensor,
     softmax_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Simple topk sparse attention varlen version implemented in torch. Extremely slow, only for debugging.
+    """Simple topk sparse attention varlen version implemented in torch. Optimized version.
 
     Args:
         q (torch.Tensor): shape [total_len, num_q_heads, head_dim]
@@ -43,79 +43,80 @@ def topk_sparse_attention_flash(
     _, num_kv_heads, _ = k.shape
     num_share_q_heads = num_q_heads // num_kv_heads
     batch_size = cu_seqlens.shape[0] - 1
-    topk = topk_idx.shape[-1]
-    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     
-    # Apply causal masking to the topk indices
-    q_idx = torch.cat(
-        [torch.arange(seqlens[i], device=q.device) for i in range(batch_size)], dim=0
-    )
-    topk_idx = topk_idx.clone()
-    topk_idx[topk_idx > (q_idx // block_size)[None, :, None]] = -1
+
     
     # Initialize the output tensor
     o = torch.zeros_like(q)
     
-    # Process all KV heads
+    # Process each KV head
     for h_kv in range(num_kv_heads):
-        # Get all blocks for this head
-        head_topk_idx = topk_idx[h_kv]  # [total_len, topk]
-        
         # Get corresponding q heads for this kv head
         q_heads_slice = slice(h_kv * num_share_q_heads, (h_kv + 1) * num_share_q_heads)
         q_heads = q[:, q_heads_slice]  # [total_len, num_share_q_heads, head_dim]
+        
+        # Get all blocks for this head
+        head_topk_idx = topk_idx[h_kv]  # [total_len, topk]
+        
+        # Create a mask of valid blocks (non-padding)
+        valid_block_mask = head_topk_idx != -1  # [total_len, topk]
+        
+        # Skip if no valid blocks for this head
+        if not valid_block_mask.any():
+            continue
         
         # Find which batch each query belongs to
         batch_indices = torch.zeros(total_seqlen, dtype=torch.long, device=q.device)
         for b in range(batch_size):
             batch_indices[cu_seqlens[b]:cu_seqlens[b+1]] = b
         
-        # Process each query position
-        for q_pos in range(total_seqlen):
-            q_blocks = head_topk_idx[q_pos]  # [topk]
-            valid_blocks = q_blocks[q_blocks != -1]  # [num_valid_blocks]
-            
-            if valid_blocks.numel() == 0:
-                continue
-            
-            # Get batch information for this query
+        # Gather all valid q positions and their corresponding block indices
+        q_positions, block_positions = torch.nonzero(valid_block_mask, as_tuple=True)
+        
+        # Unique query positions (each query may attend to multiple blocks)
+        unique_q_positions, q_counts = torch.unique(q_positions, return_counts=True)
+        
+        # Get the valid block indices
+        valid_block_indices = head_topk_idx[q_positions, block_positions]
+        
+        # Process q positions in batches
+        start_idx = 0
+        for q_pos in unique_q_positions:
+            # Get batch info for this query
             batch_idx = batch_indices[q_pos]
             batch_start = cu_seqlens[batch_idx].item()
-            batch_end = cu_seqlens[batch_idx + 1].item()
             
-            # Calculate key indices for all valid blocks
-            block_starts = valid_blocks * block_size
-            block_ends = (valid_blocks + 1) * block_size
+            # Get all block indices for this query position
+            count = q_counts[unique_q_positions == q_pos].item()
+            q_block_indices = valid_block_indices[start_idx:start_idx+count]
+            start_idx += count
             
-            # Create a mask for keys in the current batch
-            key_mask = torch.zeros(batch_end - batch_start, dtype=torch.bool, device=q.device)
+            # Calculate key indices for all blocks
+            key_indices = []
+            for block_idx in q_block_indices:
+                block_start = batch_start + block_idx * block_size
+                block_end = min(batch_start + (block_idx + 1) * block_size, cu_seqlens[batch_idx + 1])
+                key_indices.extend(range(block_start, block_end))
             
-            # Mark all keys from valid blocks
-            for b_start, b_end in zip(block_starts, block_ends):
-                b_start = max(0, b_start.item())
-                b_end = min(batch_end - batch_start, b_end.item())
-                if b_start < b_end:
-                    key_mask[b_start:b_end] = True
-            
-            # Get actual key indices
-            key_indices = batch_start + torch.nonzero(key_mask, as_tuple=True)[0]
-            
-            if key_indices.numel() == 0:
+            if not key_indices:
                 continue
                 
-            # Extract keys and values for this query
+            key_indices = torch.tensor(key_indices, device=q.device)
+            
+            # Extract keys and values
             k_selected = k[key_indices, h_kv]  # [num_keys, head_dim]
             v_selected = v[key_indices, h_kv]  # [num_keys, head_dim]
             
             # Calculate attention scores
             q_current = q_heads[q_pos]  # [num_share_q_heads, head_dim]
-            attn_scores = torch.matmul(q_current, k_selected.transpose(0, 1)) * softmax_scale  # [num_share_q_heads, num_keys]
+            attn_scores = torch.matmul(q_current, k_selected.transpose(0, 1)) * softmax_scale
             
             # Apply softmax and compute weighted sum
             attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
-            attn_output = torch.matmul(attn_weights, v_selected)  # [num_share_q_heads, head_dim]
+            attn_output = torch.matmul(attn_weights, v_selected)
             
             # Store the result
             o[q_pos, q_heads_slice] = attn_output
