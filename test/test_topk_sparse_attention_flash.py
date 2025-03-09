@@ -70,7 +70,7 @@ def generate_topk_idx_example(
         q_idx = torch.cat(
             [torch.arange(seqlens[i], device="cuda") for i in range(batch_size)], dim=0
         )
-        topk_idx[topk_idx > (q_idx // block_size)[:, None]] = -1  # -1 means padding
+        
         topk_idx_all_heads.append(topk_idx)
     topk_idx = torch.stack(topk_idx_all_heads, dim=0)
     return topk_idx
@@ -80,8 +80,18 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     batch_size = 3
     block_size = 64
-    # Ensure all sequence lengths are multiples of block_size
-    seqlens = torch.LongTensor([960, 1984, 4096]).int().cuda()  # All divisible by 64
+    topk = 5
+    
+    # Ensure all sequence lengths are at least blocksize*topk
+    min_seqlen = block_size * topk
+    # Ensure all sequence lengths are multiples of block_size and greater than min_seqlen
+    seqlens = torch.LongTensor([960, 1984, 4096]).int().cuda()  # All divisible by 64 and > min_seqlen
+    
+    # Verify that all sequences can select topk blocks
+    for seq_len in seqlens:
+        num_blocks = math.ceil(seq_len.item() / block_size)
+        assert num_blocks >= topk, f"Sequence length {seq_len} has only {num_blocks} blocks, need at least {topk}"
+    
     cu_seqlens = torch.cat(
         [
             torch.zeros(1, dtype=torch.int32, device="cuda"),
@@ -108,7 +118,6 @@ if __name__ == "__main__":
     q.requires_grad = True
     k.requires_grad = True
     v.requires_grad = True
-    topk = 5
     topk_idx = generate_topk_idx_example(seqlens, block_size, topk, 4)
 
     o = topk_sparse_attention_torch(q, k, v, topk_idx, block_size, cu_seqlens)
