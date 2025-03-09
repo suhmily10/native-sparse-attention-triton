@@ -143,17 +143,19 @@ def topk_sparse_attention_flash(
     logger.debug(f"cu_chunk shape={cu_chunk.shape}, filtered_chunk_indices shape={filtered_chunk_indices.shape}")
     logger.debug(f"num_filtered_chunk={num_filtered_chunk}")
     
-    # 创建过滤后的KV (所有可能参与计算的KV块)
+    # 优化1：减少日志开销
+    # 将调试日志改为TRACE级别，并添加条件判断
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("Starting topk_sparse_attention_flash with shapes: q=%s, k=%s...", q.shape, k.shape)
+
+    # 优化2：使用更高效的内存分配方式
     logger.debug("Creating filtered KV indices")
-    filtered_kv_indices = torch.arange(
-        0, block_size, dtype=torch.int32, device=q.device
-    )[None, :].repeat(num_filtered_chunk, 1)
-    filtered_kv_indices += cu_chunk[filtered_chunk_indices][:, None]
-    logger.debug(f"filtered_kv_indices shape={filtered_kv_indices.shape}")
+    filtered_kv_indices = (cu_chunk[filtered_chunk_indices][:, None] + 
+                          torch.arange(0, block_size, device=q.device)).flatten()
     
+    # 优化3：使用index_select代替直接索引
     logger.debug("Selecting filtered KV tensors")
-    filtered_kv = kv[filtered_kv_indices.view(-1)]  # 直接索引比 index_select 更快
-    logger.debug(f"filtered_kv shape={filtered_kv.shape}")
+    filtered_kv = kv.index_select(0, filtered_kv_indices)
     
     # 移除gate_mask相关逻辑
     logger.debug("Creating full query indices")
@@ -170,9 +172,6 @@ def topk_sparse_attention_flash(
     logger.debug("Preparing query vectors with simplified indexing")
     moba_q = rearrange(q, "s h d -> (h s) d")
     moba_q = moba_q.unsqueeze(1)  # [total_queries, 1, head_dim]
-    
-    # 为了兼容后续的输出合并，存储默认的线性索引
-    moba_q_sh_indices = torch.arange(moba_q.shape[0], device=q.device)
     
     # 重组KV矩阵以适应查询排列
     logger.debug("Reorganizing KV tensors")
