@@ -89,7 +89,6 @@ def topk_sparse_attention_flash(
     k_selected = k[block_indices.clamp_max(k.size(0)-1)]
     v_selected = v[block_indices.clamp_max(v.size(0)-1)]
     
-    import pdb; pdb.set_trace()
     # 重组为批量计算形状 [num_kv_heads, total_len, topk, block_size, head_dim]
     k_selected = k_selected.view(num_kv_heads, total_seqlen, topk, block_size, head_dim)
     v_selected = v_selected.view(num_kv_heads, total_seqlen, topk, block_size, head_dim)
@@ -97,17 +96,17 @@ def topk_sparse_attention_flash(
     # 扩展Q张量用于批量计算 [num_kv_heads, total_len, num_share_q_heads, head_dim]
     q_expanded = q.view(total_seqlen, num_kv_heads, num_share_q_heads, head_dim)
     
-    # 批量计算注意力分数 [num_kv_heads, total_len, num_share_q_heads, topk*block_size]
-    import pdb; pdb.set_trace()
-    attn_scores = torch.einsum(
-        'lkhd,lknhd->lnhk', 
-        q_expanded, 
-        k_selected.transpose(-1, -2)
-    ) * softmax_scale
+    # Reshape q_expanded to align with k_selected
+    # [total_len, num_kv_heads, num_share_q_heads, head_dim] -> [1, total_len, num_kv_heads, num_share_q_heads, head_dim]
+    q_expanded = q_expanded.unsqueeze(0)
+    # import pdb; pdb.set_trace()
+    # Compute attention scores
+    # Note: We compute dot product between query vectors and key vectors along the head_dim dimension
+    attn_scores = torch.einsum('blkhd,blnsd->blknhs', q_expanded, k_selected) * softmax_scale
     
     # 计算注意力权重并加权求和
     attn_weights = torch.softmax(attn_scores, dim=-1)
-    o = torch.einsum('lnhk,lkhd->lnhd', attn_weights, v_selected)
+    o = torch.einsum('blknhs,blnsd->blkhd', attn_weights, v_selected)
     
     # 重组输出张量 [total_len, num_q_heads, head_dim]
     return o.view(total_seqlen, num_q_heads, head_dim)
