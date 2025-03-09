@@ -96,7 +96,7 @@ def topk_sparse_attention_flash(
     block_size: int,
     cu_seqlens: torch.Tensor,
     softmax_scale: Optional[float] = None,
-    profile_profiling: bool = True,  # 新增性能分析开关
+    profile_profiling: bool = False,  # 新增性能分析开关
 ) -> torch.Tensor:
     """使用预计算的topk索引实现的稀疏注意力计算
     
@@ -157,21 +157,22 @@ def topk_sparse_attention_flash(
     
     # 移除gate_mask相关逻辑
     logger.debug("Creating full query indices")
-    # 直接使用所有查询
-    moba_q_indices = torch.arange(total_len, device=q.device).repeat(num_q_head)
-    moba_q_indices = moba_q_indices + (torch.arange(num_q_head, device=q.device) * total_len).repeat_interleave(total_len)
+    
+    # 简化索引逻辑 - 更高效的实现
+    # 之前的代码等效于创建 (h, s) -> (h*s) 的展平索引
+    # 可以直接使用 rearrange 的展平功能，无需创建复杂的索引张量
     
     # 每个chunk的查询数量固定为block_size
     moba_seqlen_q = torch.full((num_filtered_chunk * num_q_head,), block_size, device=q.device)
     moba_cu_seqlen_q = torch.arange(0, (num_filtered_chunk * num_q_head + 1) * block_size, block_size, device=q.device, dtype=torch.int32)
 
-    # 直接使用原始q矩阵
-    logger.debug("Selecting all query vectors")
-    moba_q = rearrange(q, "s h d -> (h s) d")[moba_q_indices]  # 直接索引
+    # 直接使用展平的查询矩阵，不需要额外的索引
+    logger.debug("Preparing query vectors with simplified indexing")
+    moba_q = rearrange(q, "s h d -> (h s) d")
     moba_q = moba_q.unsqueeze(1)  # [total_queries, 1, head_dim]
     
-    # 记录原始位置（直接顺序映射）
-    moba_q_sh_indices = moba_q_indices
+    # 为了兼容后续的输出合并，存储默认的线性索引
+    moba_q_sh_indices = torch.arange(moba_q.shape[0], device=q.device)
     
     # 重组KV矩阵以适应查询排列
     logger.debug("Reorganizing KV tensors")
@@ -257,23 +258,11 @@ def topk_sparse_attention_flash(
         logger.error(f"cu_seqlens_q={moba_cu_seqlen_q}, cu_seqlens_k={moba_cu_seqlen_kv}")
         raise
     
-    # 优化4: 优化结果分配逻辑，使用scatter代替index_add
-    if moba_q_sh_indices.is_contiguous():
-        # 使用更高效的内存访问模式
-        output_2d = output.view(-1, head_dim)
-        output_2d[moba_q_sh_indices] += moba_attn_out.reshape(-1, head_dim).to(output_2d.dtype)
-    else:
-        # 对非连续索引进行排序优化
-        sorted_indices, perm = torch.sort(moba_q_sh_indices)
-        output_2d = output.view(-1, head_dim)
-        output_2d.index_add_(
-            0, 
-            sorted_indices, 
-            moba_attn_out.reshape(-1, head_dim)[perm].to(output_2d.dtype)
-        )
+    # 优化4: 不需要使用索引操作，直接重塑结果
+    output = moba_attn_out.reshape(num_q_head, total_len, head_dim).transpose(0, 1)
 
     # 优化5: 避免不必要的dtype转换
-    output = output.to(q.dtype)  # 移除最后的to(q.dtype)转换，保持计算一致性
+    output = output.to(q.dtype)
     
     logger.debug(f"Completed topk_sparse_attention_flash in {time.time() - start_time:.2f}s, output shape={output.shape}")
     if profile_profiling:  # 只在开启时输出性能分析结果
