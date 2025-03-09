@@ -15,6 +15,7 @@ import triton
 import math
 import logging  # Add logging module
 import time     # Add time module for timestamps
+import gc  # Add garbage collection module
 from native_sparse_attention.ops.torch.topk_sparse_attention import (
     topk_sparse_attention_torch,
 )
@@ -84,6 +85,18 @@ def generate_topk_idx_example(
     topk_idx = torch.stack(topk_idx_all_heads, dim=0)
     return topk_idx
 
+# Define bench function similar to test_attention_speed.py
+def bench(func, warmup_steps=3, test_steps=10):
+    for i in range(warmup_steps):
+        func()
+    torch.cuda.synchronize()
+    st = time.time()
+    for i in range(test_steps):
+        func()
+    torch.cuda.synchronize()
+    ed = time.time()
+    torch.cuda.empty_cache()
+    return (ed - st) / test_steps * 1000  # Convert to ms
 
 if __name__ == "__main__":
     logger.debug("Starting test script execution")
@@ -207,36 +220,45 @@ if __name__ == "__main__":
         topk = 16
         top_idx = generate_topk_idx_example(cu_seqlens[1:], 64, topk, H // 2)
 
-        quantiles = [0.5, 0.2, 0.8]
-        if provider == "flash":
-            logger.debug(f"Running flash-attention forward benchmark with N={N}")
-            start_time = time.time()
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: _flash_attn_varlen_forward(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens,
-                    cu_seqlens,
-                    N,
-                    N,
-                    dropout_p=0.0,
-                    causal=True,
-                    softmax_scale=sm_scale,
-                ),
-                quantiles=quantiles,
-            )
-            logger.debug(f"Completed flash-attention forward benchmark in {time.time() - start_time:.2f}s")
-        if provider == "topk-flash":
-            logger.debug(f"Running topk-flash-attention forward benchmark with N={N}")
-            start_time = time.time()
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: topk_sparse_attention_flash(
-                    q, k, v, top_idx, 64, cu_seqlens, sm_scale
-                ),
-                quantiles=quantiles,
-            )
-            logger.debug(f"Completed topk-flash-attention forward benchmark in {time.time() - start_time:.2f}s")
+        try:
+            if provider == "flash":
+                logger.debug(f"Running flash-attention forward benchmark with N={N}")
+                start_time = time.time()
+                ms = bench(
+                    lambda: _flash_attn_varlen_forward(
+                        q,
+                        k,
+                        v,
+                        cu_seqlens,
+                        cu_seqlens,
+                        N,
+                        N,
+                        dropout_p=0.0,
+                        causal=True,
+                        softmax_scale=sm_scale,
+                    )
+                )
+                min_ms = ms
+                max_ms = ms
+                logger.debug(f"Completed flash-attention forward benchmark in {time.time() - start_time:.2f}s")
+            if provider == "topk-flash":
+                logger.debug(f"Running topk-flash-attention forward benchmark with N={N}")
+                start_time = time.time()
+                ms = bench(
+                    lambda: topk_sparse_attention_flash(
+                        q, k, v, top_idx, 64, cu_seqlens, sm_scale
+                    )
+                )
+                min_ms = ms
+                max_ms = ms
+                logger.debug(f"Completed topk-flash-attention forward benchmark in {time.time() - start_time:.2f}s")
+        finally:
+            # Clean up all tensors
+            del q, k, v, cu_seqlens, top_idx
+            # Force garbage collection before emptying cache
+            gc.collect()
+            torch.cuda.empty_cache()
+        
         return ms, min_ms, max_ms
 
     logger.debug("Starting forward benchmark runs")
@@ -279,59 +301,68 @@ if __name__ == "__main__":
         topk = 16
         top_idx = generate_topk_idx_example(cu_seqlens[1:], 64, topk, H // 2)
 
-        quantiles = [0.5, 0.2, 0.8]
-        if provider == "flash":
-            logger.debug(f"Running flash-attention backward benchmark with N={N}")
-            start_time = time.time()
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: _flash_attn_varlen_backward(
-                    do,
-                    q,
-                    k,
-                    v,
-                    o,
-                    lse.transpose(0, 1),
-                    dq,
-                    dk,
-                    dv,
-                    cu_seqlens,
-                    cu_seqlens,
-                    N,
-                    N,
-                    dropout_p=0.0,
-                    causal=True,
-                    softmax_scale=sm_scale,
-                    window_size_left=-1,
-                    window_size_right=-1,
-                    softcap=0.0,
-                    alibi_slopes=None,
-                    deterministic=False,
-                ),
-                quantiles=quantiles,
-            )
-            logger.debug(f"Completed flash-attention backward benchmark in {time.time() - start_time:.2f}s")
-        elif provider == "topk-flash":
-            logger.debug(f"Running topk-flash-attention backward benchmark with N={N}")
-            start_time = time.time()
-            
-            # For backward benchmarking, we need to run forward first with grad enabled
-            q_bench = q.clone().detach().requires_grad_()
-            k_bench = k.clone().detach().requires_grad_()
-            v_bench = v.clone().detach().requires_grad_()
-            
-            def run_forward_backward():
-                # Forward pass
-                out = topk_sparse_attention_flash(
-                    q_bench, k_bench, v_bench, top_idx, 64, cu_seqlens, sm_scale
+        try:
+            if provider == "flash":
+                logger.debug(f"Running flash-attention backward benchmark with N={N}")
+                start_time = time.time()
+                ms = bench(
+                    lambda: _flash_attn_varlen_backward(
+                        do,
+                        q,
+                        k,
+                        v,
+                        o,
+                        lse.transpose(0, 1),
+                        dq,
+                        dk,
+                        dv,
+                        cu_seqlens,
+                        cu_seqlens,
+                        N,
+                        N,
+                        dropout_p=0.0,
+                        causal=True,
+                        softmax_scale=sm_scale,
+                        window_size_left=-1,
+                        window_size_right=-1,
+                        softcap=0.0,
+                        alibi_slopes=None,
+                        deterministic=False,
+                    )
                 )
-                # Backward pass
-                out.backward(do, retain_graph=True)
+                min_ms = ms
+                max_ms = ms
+                logger.debug(f"Completed flash-attention backward benchmark in {time.time() - start_time:.2f}s")
+            elif provider == "topk-flash":
+                logger.debug(f"Running topk-flash-attention backward benchmark with N={N}")
+                start_time = time.time()
                 
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                run_forward_backward,
-                quantiles=quantiles,
-            )
-            logger.debug(f"Completed topk-flash-attention backward benchmark in {time.time() - start_time:.2f}s")
+                # For backward benchmarking, we need to run forward first with grad enabled
+                q_bench = q.clone().detach().requires_grad_()
+                k_bench = k.clone().detach().requires_grad_()
+                v_bench = v.clone().detach().requires_grad_()
+                
+                def run_forward_backward():
+                    # Forward pass
+                    out = topk_sparse_attention_flash(
+                        q_bench, k_bench, v_bench, top_idx, 64, cu_seqlens, sm_scale
+                    )
+                    # Backward pass
+                    out.backward(do, retain_graph=True)
+                    
+                ms = bench(run_forward_backward)
+                min_ms = ms
+                max_ms = ms
+                logger.debug(f"Completed topk-flash-attention backward benchmark in {time.time() - start_time:.2f}s")
+        finally:
+            # Clean up all tensors
+            del q, k, v, o, do, lse, cu_seqlens, dq, dk, dv, top_idx
+            if provider == "topk-flash":
+                del q_bench, k_bench, v_bench
+            # Force garbage collection before emptying cache
+            gc.collect()
+            torch.cuda.empty_cache()
+        
         return ms, min_ms, max_ms
 
     logger.debug("Starting backward benchmark runs")

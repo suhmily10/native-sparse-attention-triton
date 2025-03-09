@@ -33,8 +33,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=16)
-def calc_chunks(cu_seqlen, moba_chunk_size):
-    """calc chunks for moba attention (keeping all chunks including last ones)"""
+def calc_chunks(cu_seqlen, moba_chunk_size, topk_idx=None):
+    """calc chunks for moba attention with option to filter by topk indices
+    
+    Args:
+        cu_seqlen: Cumulative sequence lengths
+        moba_chunk_size: Size of each chunk
+        topk_idx: Optional tensor of shape [num_kv_heads, total_len, topk] containing topk block indices
+                 If provided, only return chunks selected by these indices
+    """
     logger.debug(f"calc_chunks: cu_seqlen shape={cu_seqlen.shape}, moba_chunk_size={moba_chunk_size}")
 
     # batch_sizes[batch_idx] = batch size ( seqlen ) of batch idx
@@ -66,10 +73,28 @@ def calc_chunks(cu_seqlen, moba_chunk_size):
     chunk_to_batch[cu_num_chunk[1:-1]] = 1
     chunk_to_batch = chunk_to_batch.cumsum(dim=0, dtype=torch.int32)
 
-    # Use all chunks instead of filtering out the last chunk of each batch
+    # Default: use all chunks
     all_chunk_indices = torch.arange(num_chunk, device=cu_seqlen.device)
+    
+    # If topk_idx is provided, filter chunks to only include those in topk_idx
+    if topk_idx is not None:
+        logger.debug(f"Filtering chunks using topk_idx with shape {topk_idx.shape}")
+        # Extract unique chunk indices from topk_idx
+        # Reshape to flatten all dimensions and remove padding (-1 values)
+        flat_topk = topk_idx.reshape(-1)
+        selected_chunks = flat_topk[flat_topk >= 0].unique()
+        
+        # Ensure selected_chunks are within valid range
+        valid_mask = (selected_chunks < num_chunk)
+        if not valid_mask.all():
+            logger.warning(f"Found {(~valid_mask).sum()} invalid chunk indices in topk_idx")
+            selected_chunks = selected_chunks[valid_mask]
+        
+        # Use selected chunks instead of all chunks
+        all_chunk_indices = selected_chunks
+        logger.debug(f"Selected {len(selected_chunks)} unique chunks from topk_idx")
 
-    logger.debug(f"calc_chunks: returning {num_chunk} chunks (keeping all chunks)")
+    logger.debug(f"calc_chunks: returning {len(all_chunk_indices)} chunks")
     return (
         cu_chunk,
         all_chunk_indices,
@@ -130,7 +155,7 @@ def topk_sparse_attention_flash(
         num_chunk,
         _,
         chunk_to_batch,
-    ) = calc_chunks(cu_seqlens, block_size)
+    ) = calc_chunks(cu_seqlens, block_size, topk_idx)
     logger.debug(f"cu_chunk shape={cu_chunk.shape}, all_chunk_indices shape={all_chunk_indices.shape}")
     logger.debug(f"num_chunk={num_chunk}")
     
