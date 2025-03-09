@@ -37,7 +37,7 @@ from native_sparse_attention.ops.torch.topk_sparse_attention_flash import (
 
 # Set up logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%H:%M:%S'
 )
@@ -90,13 +90,13 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     batch_size = 3
     block_size = 64
-    topk = 5
+    topk = 16
     
     logger.info("Preparing test data and parameters")
     # Ensure all sequence lengths are at least blocksize*topk
     min_seqlen = block_size * topk
     # Ensure all sequence lengths are multiples of block_size and greater than min_seqlen
-    seqlens = torch.LongTensor([960, 1984, 4096]).int().cuda()  # All divisible by 64 and > min_seqlen
+    seqlens = torch.LongTensor([1024, 2048, 4096]).int().cuda()  # All divisible by 64 and > min_seqlen
     
     # Verify that all sequences can select topk blocks
     for seq_len in seqlens:
@@ -204,7 +204,7 @@ if __name__ == "__main__":
         sm_scale = 1 / math.sqrt(D)
 
         # Generate topk indices for sparse attention
-        topk = 5
+        topk = 16
         top_idx = generate_topk_idx_example(cu_seqlens[1:], 64, topk, H // 2)
 
         quantiles = [0.5, 0.2, 0.8]
@@ -276,7 +276,7 @@ if __name__ == "__main__":
         dv = torch.zeros_like(v)
         
         # Generate topk indices for sparse attention
-        topk = 5
+        topk = 16
         top_idx = generate_topk_idx_example(cu_seqlens[1:], 64, topk, H // 2)
 
         quantiles = [0.5, 0.2, 0.8]
