@@ -56,32 +56,57 @@ def generate_topk_idx_example(
         num_heads (int): number of key value heads
 
     Returns:
-        torch.Tensor: shape [num_heads, total_seqlen, topk], topk key value block idx for each query. -1 means padding.
+        torch.Tensor: shape [num_heads, total_seqlen, topk], topk key value block idx for each query.
     """
     batch_size = seqlens.shape[0]
+    
+    # 计算每个序列的块数
     num_blocks = torch.ceil(seqlens / block_size).to(torch.int32)
+    
+    # 计算每个序列的起始块索引（绝对块偏移）
+    block_offsets = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        torch.cumsum(num_blocks, dim=0)
+    ])
+    
+    # 计算每个序列的起始token索引（绝对token偏移）
+    token_offsets = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        torch.cumsum(seqlens, dim=0)
+    ])
+    
     topk_idx_all_heads = []
     for _ in range(num_heads):
-        topk_idx = [
-            torch.randn(seqlens[i], num_blocks[i], device="cuda")
-            .topk(min(topk, num_blocks[i]), dim=-1)
-            .indices.to(torch.int32)
-            for i in range(batch_size)
-        ]
-        topk_idx = [
-            torch.nn.functional.pad(
-                topk_idx[i], (0, topk - topk_idx[i].shape[-1]), value=-1
-            )
-            for i in range(batch_size)
-        ]
+        topk_idx = []
+        for i in range(batch_size):
+            seq_blocks = num_blocks[i]
+            block_offset = block_offsets[i]  # 当前序列的块偏移
+            seq_len = seqlens[i]
+            token_offset = token_offsets[i]  # 当前序列的token偏移
+            
+            # 确保每个序列都有足够的块可选
+            assert seq_blocks >= topk, f"Sequence {i} has only {seq_blocks} blocks, fewer than topk={topk}"
+            
+            # 为每个token生成相对块索引并转换为绝对块索引
+            relative_idx = torch.randn(seq_len, seq_blocks, device="cuda") \
+                             .topk(topk, dim=-1).indices
+            absolute_idx = relative_idx + block_offset  # 转换为绝对块索引
+            
+            topk_idx.append(absolute_idx.to(torch.int32))
+            
         topk_idx = torch.cat(topk_idx, dim=0)
         topk_idx = torch.sort(topk_idx, dim=1).values
-        topk_idx[:, 0] = 0
-        q_idx = torch.cat(
-            [torch.arange(seqlens[i], device="cuda") for i in range(batch_size)], dim=0
+        
+        # 每个查询至少需要一个有效块
+        # 确保第一个索引总是有效的（设为对应的块索引）
+        flat_q_idx = torch.cat(
+            [torch.arange(seqlens[i], device="cuda") + token_offsets[i] for i in range(batch_size)]
         )
+        first_block_idx = torch.div(flat_q_idx, block_size, rounding_mode='floor')
+        topk_idx[:, 0] = first_block_idx
         
         topk_idx_all_heads.append(topk_idx)
+        
     topk_idx = torch.stack(topk_idx_all_heads, dim=0)
     return topk_idx
 
@@ -102,14 +127,14 @@ if __name__ == "__main__":
     logger.debug("Starting test script execution")
     torch.manual_seed(42)
     batch_size = 3
-    block_size = 256
-    topk = 4
+    block_size = 64
+    topk = 16
     
     logger.debug("Preparing test data and parameters")
     # Ensure all sequence lengths are at least blocksize*topk
     min_seqlen = block_size * topk
     # Ensure all sequence lengths are multiples of block_size and greater than min_seqlen
-    seqlens = torch.LongTensor([1024, 2048, 4096]).int().cuda()  # All divisible by 64 and > min_seqlen
+    seqlens = torch.LongTensor([4096]).int().cuda()  # All divisible by 64 and > min_seqlen
     
     # Verify that all sequences can select topk blocks
     for seq_len in seqlens:
@@ -125,24 +150,25 @@ if __name__ == "__main__":
     ).to(torch.int32)
     max_seqlen = seqlens.max().item()
     q = (
-        torch.empty(cu_seqlens[-1], 8, 96, device="cuda")
+        torch.empty(cu_seqlens[-1], 32, 128, device="cuda")
         .uniform_(-1, 1)
         .to(torch.bfloat16)
     )
     k = (
-        torch.empty(cu_seqlens[-1], 4, 96, device="cuda")
+        torch.empty(cu_seqlens[-1], 8, 128, device="cuda")
         .uniform_(-1, 1)
         .to(torch.bfloat16)
     )
     v = (
-        torch.empty(cu_seqlens[-1], 4, 96, device="cuda")
+        torch.empty(cu_seqlens[-1], 8, 128, device="cuda")
         .uniform_(-1, 1)
         .to(torch.bfloat16)
     )
     q.requires_grad = True
     k.requires_grad = True
     v.requires_grad = True
-    topk_idx = generate_topk_idx_example(seqlens, block_size, topk, 4)
+    # import pdb; pdb.set_trace()
+    topk_idx = generate_topk_idx_example(seqlens, block_size, topk, 8)
 
     logger.debug("Running test implementation: topk_sparse_attention_flash")
     torch.manual_seed(42)
@@ -186,16 +212,20 @@ if __name__ == "__main__":
     print("Max Value Gradient Error:", (v1.grad - v2.grad).abs().max().item())
     print()
     logger.debug("Comparison completed")
+    
+    gc.collect()
+    torch.cuda.empty_cache()
+    
 
     # benchmark forward pass
     logger.debug("Setting up forward pass benchmark")
     def benchmark_forward():
         N_vals = [1024 * 2**i for i in range(1, 6)]
-        H = 8
-        D = 96
+        H = 32
+        D = 128
         providers = ["flash", "topk-flash"]
         
-        print("\n** Forward benchmark with block size 256 **")
+        print("\n** Forward benchmark with block size 64 **")
         print(f"{'N':<10} {'Flash (ms)':<15} {'TopK-Flash (ms)':<15}")
         print("-" * 40)
         
@@ -205,14 +235,14 @@ if __name__ == "__main__":
             for provider in providers:
                 logger.debug(f"Forward benchmark: N={N}, H={H}, D={D}, provider={provider}")
                 q = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
-                k = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
-                v = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
+                k = torch.randn((N, H // 4, D), device="cuda", dtype=torch.bfloat16)
+                v = torch.randn((N, H // 4, D), device="cuda", dtype=torch.bfloat16)
                 cu_seqlens = torch.tensor([0, N], device="cuda", dtype=torch.int32)
                 sm_scale = 1 / math.sqrt(D)
 
                 # Generate topk indices for sparse attention
-                topk = 4
-                top_idx = generate_topk_idx_example(cu_seqlens[1:], 256, topk, H // 2)
+                topk = 16
+                top_idx = generate_topk_idx_example(cu_seqlens[1:], 64, topk, H // 4)
 
                 try:
                     if provider == "flash":
@@ -230,7 +260,7 @@ if __name__ == "__main__":
                         start_time = time.time()
                         ms = bench(
                             lambda: topk_sparse_attention_flash(
-                                q, k, v, top_idx, 256, cu_seqlens, sm_scale
+                                q, k, v, top_idx, 64, cu_seqlens, sm_scale
                             )
                         )
                         logger.debug(f"Completed topk-flash-attention forward benchmark in {time.time() - start_time:.2f}s")
@@ -253,11 +283,11 @@ if __name__ == "__main__":
     logger.debug("Setting up backward pass benchmark")
     def benchmark_backward():
         N_vals = [1024 * 2**i for i in range(1, 6)]
-        H = 8
-        D = 96
+        H = 32
+        D = 128
         providers = ["flash", "topk-flash"]
         
-        print("\n** Backward benchmark with block size 256 **")
+        print("\n** Backward benchmark with block size 64 **")
         print(f"{'N':<10} {'Flash (ms)':<15} {'TopK-Flash (ms)':<15}")
         print("-" * 40)
         
@@ -267,8 +297,8 @@ if __name__ == "__main__":
             for provider in providers:
                 logger.debug(f"Backward benchmark: N={N}, H={H}, D={D}, provider={provider}")
                 q = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
-                k = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
-                v = torch.randn((N, H // 2, D), device="cuda", dtype=torch.bfloat16)
+                k = torch.randn((N, H // 4, D), device="cuda", dtype=torch.bfloat16)
+                v = torch.randn((N, H // 4, D), device="cuda", dtype=torch.bfloat16)
                 o = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
                 do = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
                 lse = torch.randn((N, H), device="cuda", dtype=torch.bfloat16)
@@ -279,8 +309,8 @@ if __name__ == "__main__":
                 dv = torch.zeros_like(v)
                 
                 # Generate topk indices for sparse attention
-                topk = 4
-                top_idx = generate_topk_idx_example(cu_seqlens[1:], 256, topk, H // 2)
+                topk = 16
+                top_idx = generate_topk_idx_example(cu_seqlens[1:], 64, topk, H // 4)
 
                 try:
                     if provider == "flash":
@@ -307,7 +337,7 @@ if __name__ == "__main__":
                         def run_forward_backward():
                             # Forward pass
                             out = topk_sparse_attention_flash(
-                                q_bench, k_bench, v_bench, top_idx, 256, cu_seqlens, sm_scale
+                                q_bench, k_bench, v_bench, top_idx, 64, cu_seqlens, sm_scale
                             )
                             # Backward pass
                             out.backward(do, retain_graph=True)
@@ -339,8 +369,8 @@ if __name__ == "__main__":
     def benchmark_batch_sizes():
         B_vals = [1, 2, 4, 8, 16]
         N = 8192
-        H = 8
-        D = 96
+        H = 32
+        D = 128
         providers = ["flash", "topk-flash"]
         
         print("\n** Batch size performance comparison with seq length 4096 **")
@@ -368,16 +398,16 @@ if __name__ == "__main__":
                 
                 # Create input tensors
                 q = torch.randn((total_tokens, H, D), device="cuda", dtype=torch.bfloat16)
-                k = torch.randn((total_tokens, H // 2, D), device="cuda", dtype=torch.bfloat16)
-                v = torch.randn((total_tokens, H // 2, D), device="cuda", dtype=torch.bfloat16)
+                k = torch.randn((total_tokens, H // 4, D), device="cuda", dtype=torch.bfloat16)
+                v = torch.randn((total_tokens, H // 4, D), device="cuda", dtype=torch.bfloat16)
                 
                 # Parameters for topk sparse attention
-                block_size = 256
-                topk = 4
+                block_size = 64
+                topk = 16
                 
                 # Generate topk indices for sparse attention
                 top_idx = generate_topk_idx_example(torch.ones(B, device="cuda", dtype=torch.int32) * N, 
-                                                   block_size, topk, H // 2)
+                                                   block_size, topk, H // 4)
                 
                 try:
                     if provider == "flash":
