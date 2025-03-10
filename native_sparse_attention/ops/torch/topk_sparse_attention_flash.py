@@ -25,14 +25,27 @@ from einops import rearrange
 from functools import lru_cache
 
 # Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
-)
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format='%(asctime)s - %(levelname)s - %(message)s',
+#     datefmt='%H:%M:%S'
+# )
 logger = logging.getLogger(__name__)
 
-
+@lru_cache(maxsize=16)
+def calc_topk_chunks(topk_idx: torch.Tensor, block_size: int):
+    """Calculate and cache chunk information for topk sparse attention"""
+    unique_chunks = torch.unique(topk_idx[topk_idx >= 0])
+    num_chunk = unique_chunks.size(0)
+    
+    # Calculate chunk indices for KV selection
+    chunk_indices = (unique_chunks[:, None] * block_size + 
+                    torch.arange(0, block_size, device=topk_idx.device)).flatten()
+    
+    # Calculate cumulative sequence lengths for chunks
+    cu_seqlen = torch.arange(0, (num_chunk + 1), device=topk_idx.device, dtype=torch.int32) * block_size
+    
+    return chunk_indices, cu_seqlen
 
 def topk_sparse_attention_flash(
     q: torch.Tensor,
@@ -59,39 +72,22 @@ def topk_sparse_attention_flash(
     Returns:
         torch.Tensor: 注意力输出，形状 [total_len, num_q_heads, head_dim]
     """
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(f"Starting topk_sparse_attention_flash with shapes: q={q.shape}, k={k.shape}, v={v.shape}, topk_idx={topk_idx.shape}")
-        logger.debug(f"block_size={block_size}, cu_seqlens={cu_seqlens}")
-    
+
     # 合并变量定义和基本设置
     total_len, num_q_head, head_dim = q.shape
     num_kv_head = topk_idx.shape[0]
     softmax_scale = softmax_scale or head_dim ** (-0.5)
     
-    # 高效地提取唯一块索引，减少内存占用
-    mask = topk_idx >= 0
-    unique_chunks = torch.unique(torch.masked_select(topk_idx, mask))
-    num_chunk = unique_chunks.size(0)
+    # Use cached chunk calculations
+    chunk_indices, moba_cu_seqlen = calc_topk_chunks(topk_idx, block_size)
     
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(f"Found {num_chunk} unique chunk indices")
+    # Efficient KV selection using pre-calculated indices
+    filtered_kv = torch.stack((k, v), dim=1)[chunk_indices]
     
-    # 创建KV索引并选择相关KV (合并操作减少中间变量)
-    filtered_kv = torch.stack((k, v), dim=1).index_select(
-        0, 
-        (unique_chunks[:, None] * block_size + torch.arange(0, block_size, device=q.device)).flatten()
-    )
-    
-    # 创建cu_seqlen和准备查询矩阵 (减少中间变量)
-    moba_cu_seqlen = torch.arange(0, (num_chunk * num_q_head + 1) * block_size, block_size, 
-                                 device=q.device, dtype=torch.int32)
-    
-    # 准备查询和KV矩阵 (合并操作)
-    moba_q = q.transpose(0, 1).reshape(-1, head_dim).unsqueeze(1)  # [num_q_head*total_len, 1, head_dim]
-    
-    # 重组KV矩阵 (简化转换步骤)
-    moba_kv = filtered_kv.reshape(-1, 2, num_kv_head, head_dim)
-    moba_kv = moba_kv.transpose(1, 2).reshape(-1, block_size, 2, head_dim)
+    # Optimize query and KV matrix transformations
+    moba_q = rearrange(q, 't h d -> (h t) 1 d')
+    moba_kv = rearrange(filtered_kv, '(c b) pair h d -> (c h) b pair d', b=block_size)
+    moba_kv = rearrange(moba_kv, 'n b pair d -> (n b) pair 1 d')
     
     # 处理不同数量的q和kv heads (修改后)
     # Flash Attention 2+ 原生支持GQA，直接传递原始head数量即可
@@ -99,57 +95,22 @@ def topk_sparse_attention_flash(
         assert num_q_head % num_kv_head == 0, "q_heads must be multiple of kv_heads for GQA"
         # 不再需要重复interleave操作
     
-    # 准备最终KV格式 (保持原有形状)
-    moba_kv = moba_kv.flatten(start_dim=0, end_dim=1).unsqueeze(2)  # [num_chunks*block_size, 2, 1, head_dim]
-    
     # 使用flash attention计算输出
-    try:
-        if profile_profiling:
-            with torch.profiler.profile(
-                activities=[torch.profiler.ProfilerActivity.CUDA],
-                with_stack=False,
-                record_shapes=False,
-                profile_memory=True,
-                with_flops=True,
-                use_cuda=True
-            ) as prof:
-                torch.cuda.synchronize()
-                start_event, end_event = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                
-                start_event.record()
-                out = flash_attn_varlen_func(
-                    q=moba_q,
-                    k=moba_kv[:, 0],
-                    v=moba_kv[:, 1],
-                    cu_seqlens_q=moba_cu_seqlen,
-                    cu_seqlens_k=moba_cu_seqlen,
-                    max_seqlen_q=total_len,
-                    max_seqlen_k=block_size,
-                    causal=False,
-                    dropout_p=0.0,
-                )
-                end_event.record()
-                torch.cuda.synchronize()
-                logger.info(f"GPU Time: {start_event.elapsed_time(end_event):.2f} ms")
-                logger.info(f"Profiling summary:\n{prof.key_averages().table(sort_by='cuda_time_total', row_limit=10)}")
-        else:
-            # 使用异步执行和混合精度
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
-                out = flash_attn_varlen_func(
-                    q=moba_q,
-                    k=moba_kv[:, 0],
-                    v=moba_kv[:, 1],
-                    cu_seqlens_q=moba_cu_seqlen,
-                    cu_seqlens_k=moba_cu_seqlen,
-                    max_seqlen_q=total_len,
-                    max_seqlen_k=block_size,
-                    causal=False,
-                    dropout_p=0.0,
-                )
-    except Exception as e:
-        logger.error(f"Error in flash_attn_varlen_func: {str(e)}")
-        logger.error(f"Shapes: q={moba_q.shape}, k={moba_kv[:, 0].shape}, v={moba_kv[:, 1].shape}")
-        raise
+
+    # 使用异步执行和混合精度
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
+        out = flash_attn_varlen_func(
+            q=moba_q,
+            k=moba_kv[:, 0],
+            v=moba_kv[:, 1],
+            cu_seqlens_q=moba_cu_seqlen,
+            cu_seqlens_k=moba_cu_seqlen,
+            max_seqlen_q=total_len,
+            max_seqlen_k=block_size,
+            causal=False,
+            dropout_p=0.0,
+        )
+
     
-    # 直接重塑输出并返回 (简化类型转换)
-    return out.reshape(num_q_head, total_len, head_dim).transpose(0, 1).to(q.dtype)
+    # 优化返回结果转换
+    return rearrange(out, '(h t) 1 d -> t h d', h=num_q_head).to(q.dtype)  # 合并reshape和transpose

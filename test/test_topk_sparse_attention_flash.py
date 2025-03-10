@@ -38,7 +38,7 @@ from native_sparse_attention.ops.torch.topk_sparse_attention_flash import (
 
 # Set up logging
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%H:%M:%S'
 )
@@ -134,7 +134,7 @@ if __name__ == "__main__":
     # Ensure all sequence lengths are at least blocksize*topk
     min_seqlen = block_size * topk
     # Ensure all sequence lengths are multiples of block_size and greater than min_seqlen
-    seqlens = torch.LongTensor([4096]).int().cuda()  # All divisible by 64 and > min_seqlen
+    seqlens = torch.LongTensor([1024, 2048, 4096]).int().cuda()  # All divisible by 64 and > min_seqlen
     
     # Verify that all sequences can select topk blocks
     for seq_len in seqlens:
@@ -233,6 +233,10 @@ if __name__ == "__main__":
             results = {}
             
             for provider in providers:
+                # Log memory usage before benchmark
+                memory_before = torch.cuda.memory_allocated() / (1024**3)
+                logger.debug(f"Before {provider} forward benchmark (N={N}): {memory_before:.2f} GB allocated")
+                
                 logger.debug(f"Forward benchmark: N={N}, H={H}, D={D}, provider={provider}")
                 q = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
                 k = torch.randn((N, H // 4, D), device="cuda", dtype=torch.bfloat16)
@@ -272,6 +276,11 @@ if __name__ == "__main__":
                     # Force garbage collection before emptying cache
                     gc.collect()
                     torch.cuda.empty_cache()
+                    
+                    # Log memory usage after cleanup
+                    memory_after = torch.cuda.memory_allocated() / (1024**3)
+                    logger.debug(f"After {provider} forward benchmark (N={N}): {memory_after:.2f} GB allocated")
+                    logger.debug(f"Memory cleaned up: {memory_before - memory_after:.2f} GB")
             
             print(f"{N:<10} {results.get('flash', 'N/A'):<15.2f} {results.get('topk-flash', 'N/A'):<15.2f}")
 
@@ -295,6 +304,10 @@ if __name__ == "__main__":
             results = {}
             
             for provider in providers:
+                # Log memory usage before benchmark
+                memory_before = torch.cuda.memory_allocated() / (1024**3)
+                logger.debug(f"Before {provider} backward benchmark (N={N}): {memory_before:.2f} GB allocated")
+                
                 logger.debug(f"Backward benchmark: N={N}, H={H}, D={D}, provider={provider}")
                 q = torch.randn((N, H, D), device="cuda", dtype=torch.bfloat16)
                 k = torch.randn((N, H // 4, D), device="cuda", dtype=torch.bfloat16)
@@ -357,6 +370,11 @@ if __name__ == "__main__":
                     # Force garbage collection before emptying cache
                     gc.collect()
                     torch.cuda.empty_cache()
+                    
+                    # Log memory usage after cleanup
+                    memory_after = torch.cuda.memory_allocated() / (1024**3)
+                    logger.debug(f"After {provider} backward benchmark (N={N}): {memory_after:.2f} GB allocated")
+                    logger.debug(f"Memory cleaned up: {memory_before - memory_after:.2f} GB")
             
             print(f"{N:<10} {results.get('flash', 'N/A'):<15.2f} {results.get('topk-flash', 'N/A'):<15.2f}")
 
@@ -373,19 +391,24 @@ if __name__ == "__main__":
         D = 128
         providers = ["flash", "topk-flash"]
         
-        print("\n** Batch size performance comparison with seq length 4096 **")
+        print(f"\n** Batch size performance comparison with seq length {N} **")
         print(f"{'B':<10} {'Flash (ms)':<15} {'TopK-Flash (ms)':<15}")
         print("-" * 40)
         
         for B in B_vals:
             results = {}
-            logger.debug(f"Batch size benchmark: B={B}, N={N}, H={H}, D={D}")
+            # Log memory before batch test
+            memory_before_batch = torch.cuda.memory_allocated() / (1024**3)
+            logger.debug(f"Before batch B={B} benchmark: {memory_before_batch:.2f} GB allocated")
             
             # Clear CUDA cache before creating new tensors
             torch.cuda.empty_cache()
-            logger.debug(f"Starting benchmark B={B}, memory: {torch.cuda.memory_reserved()//1024**3} GB")
             
             for provider in providers:
+                # Log memory before provider test
+                memory_before = torch.cuda.memory_allocated() / (1024**3)
+                logger.debug(f"Before {provider} batch benchmark (B={B}): {memory_before:.2f} GB allocated")
+                
                 # Total number of tokens across all batches
                 total_tokens = B * N
                 
@@ -437,8 +460,19 @@ if __name__ == "__main__":
                     # Force garbage collection before emptying cache
                     gc.collect()
                     torch.cuda.empty_cache()
+                    
+                    # Log memory usage after cleanup
+                    memory_after = torch.cuda.memory_allocated() / (1024**3)
+                    logger.debug(f"After {provider} batch benchmark (B={B}): {memory_after:.2f} GB allocated")
+                    logger.debug(f"Memory cleaned up: {memory_before - memory_after:.2f} GB")
             
             print(f"{B:<10} {results.get('flash', 'N/A'):<15.2f} {results.get('topk-flash', 'N/A'):<15.2f}")
+            
+            # Log memory after batch test
+            memory_after_batch = torch.cuda.memory_allocated() / (1024**3)
+            logger.debug(f"After batch B={B} benchmark: {memory_after_batch:.2f} GB allocated")
+            logger.debug(f"Total memory cleaned up for batch: {memory_before_batch - memory_after_batch:.2f} GB")
+            logger.debug("-" * 30)
 
     logger.debug("Starting batch size benchmark runs")
     benchmark_batch_sizes()
